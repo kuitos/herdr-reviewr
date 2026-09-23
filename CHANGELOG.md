@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-09-23
+
 ### Added
 - **`url_opener` opens links through your own command**, e.g. a browser bridge under `herdr --remote`.
   Thanks [@elrandar](https://github.com/elrandar) ([#102](https://github.com/persiyanov/herdr-reviewr/pull/102)).
