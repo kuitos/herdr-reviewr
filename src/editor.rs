@@ -187,7 +187,7 @@ fn wants_terminal(program: &str, args: &[String]) -> bool {
 /// A plain whitespace split cannot express `/Applications/Sublime Text.app/.../subl`, which is
 /// how macOS spells most editor paths. Quoting is the only escape, since no shell runs the
 /// command. A quote closes at its match or at the end of the string.
-fn split_command(value: &str) -> Vec<String> {
+pub(crate) fn split_command(value: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut started = false;

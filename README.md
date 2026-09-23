@@ -298,6 +298,20 @@ else is your editor's:
 editor = "code -g {file}:{line}"
 ```
 
+### URL opener
+
+`o` and link clicks open URLs with `open` (macOS) or `xdg-open` (Linux). Under `herdr --remote`
+that runs on the server, so point `url_opener` at a command that reaches your browser:
+
+```toml
+url_opener = "browser-bridge --new-tab {url}"
+```
+
+It reads like the `editor` key: quotes group words, and `{url}` goes where you put it, or at the
+end. The URL always arrives as one argument, never through a shell. So don't use
+`ssh host open {url}`: ssh hands its arguments to the remote shell, where a crafted link could run
+commands.
+
 ### Keybindings
 
 `[keybindings]` maps an action name to an array of keys. The array replaces that action's
