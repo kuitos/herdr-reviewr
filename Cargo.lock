@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "herdr-reviewr"
-version = "0.39.0-kuitos.1"
+version = "0.39.0-kuitos.2"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",

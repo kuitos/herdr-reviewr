@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.39.0-kuitos.2] - 2026-09-25
+
 ### Fixed
 - **A drag now keeps its selection for `c`.** A poll landing while the mouse button was down
   blanked the settled highlight on release even when the text under it was unchanged, so after
