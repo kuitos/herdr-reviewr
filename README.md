@@ -1,5 +1,7 @@
 # herdr-reviewr
 
+> **Fork** of [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) with: non-git directories, comments on a character-level selection (#109), `deliver = "immediate"` and a readiness check before sending (#86). Install with `herdr plugin install kuitos/herdr-reviewr`; the plugin id stays `persiyanov.reviewr`.
+
 [![CI](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/persiyanov/herdr-reviewr)](https://github.com/persiyanov/herdr-reviewr/releases/latest)
 [![License](https://img.shields.io/github/license/persiyanov/herdr-reviewr)](LICENSE)

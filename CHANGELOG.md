@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.39.0-kuitos.1] - 2026-09-25
+
+Fork of persiyanov/herdr-reviewr v0.39.0.
+
 ### Added
 - **reviewr opens in a directory that is not a git repository.** **All files** lists it
   (honoring `.gitignore`), and the viewer, line comments, and search work as in a repo.

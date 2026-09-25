@@ -10,7 +10,7 @@
 set -euo pipefail
 
 NAME="herdr-reviewr"
-REPO="persiyanov/herdr-reviewr"
+REPO="kuitos/herdr-reviewr"   # fork: releases come from the fork, not upstream
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="$ROOT/bin"
