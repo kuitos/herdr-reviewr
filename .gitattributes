@@ -1,0 +1,3 @@
+# Fork: the fork and upstream both add sections at the top on every release; keep both
+# (the sync-upstream workflow merges upstream releases, so this would conflict every time).
+CHANGELOG.md merge=union

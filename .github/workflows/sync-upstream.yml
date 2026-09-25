@@ -1,0 +1,226 @@
+name: sync upstream
+
+# Fork housekeeping: once a day, look for an upstream release (a `v*` tag on
+# persiyanov/herdr-reviewr) this fork has not merged yet, and try merging it into `main`.
+#
+# - A clean merge that passes fmt, clippy and the tests opens a PR against `main`.
+# - A clean merge whose checks fail opens a draft PR, so the fix can land on its branch.
+# - A conflicting merge opens an issue listing the conflicted files.
+#
+# Nothing is merged, tagged or released automatically. The checks run here rather than on the
+# PR because a PR opened with GITHUB_TOKEN triggers no other workflow (GitHub's rule), so the
+# regular CI would never see it.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream tag or branch to merge (default: the latest upstream release tag)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Report only: push nothing, open no PR or issue"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: persiyanov/herdr-reviewr
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Pick the upstream ref
+        id: target
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --quiet --tags upstream '+refs/heads/*:refs/remotes/upstream/*'
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            # The newest upstream release; this fork's own tags carry a `-kuitos` suffix.
+            ref="$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-kuitos' | head -1)"
+          fi
+          if git rev-parse -q --verify "refs/tags/${ref}^{commit}" >/dev/null; then
+            sha="$(git rev-parse "refs/tags/${ref}^{commit}")"
+          elif git rev-parse -q --verify "refs/remotes/upstream/${ref}^{commit}" >/dev/null; then
+            sha="$(git rev-parse "refs/remotes/upstream/${ref}^{commit}")"
+          else
+            echo "::error::no upstream tag or branch named '${ref}'"
+            exit 1
+          fi
+          slug="$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '-')"
+          branch="sync/upstream-${slug}"
+          skip=""
+          if git merge-base --is-ancestor "$sha" HEAD; then
+            skip="main already contains upstream ${ref}"
+          elif [ "$(gh pr list --head "$branch" --state open --json number --jq length)" != "0" ]; then
+            skip="a sync PR for ${ref} is already open"
+          elif [ "$(gh issue list --state open --search "in:title \"upstream ${ref}\"" --json number --jq length)" != "0" ]; then
+            skip="a sync issue for ${ref} is already open"
+          fi
+          {
+            echo "ref=${ref}"
+            echo "sha=${sha}"
+            echo "branch=${branch}"
+            echo "skip=${skip}"
+          } >> "$GITHUB_OUTPUT"
+          if [ -n "$skip" ]; then echo "Nothing to do: ${skip}." | tee -a "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Merge
+        id: merge
+        if: steps.target.outputs.skip == ''
+        env:
+          REF: ${{ steps.target.outputs.ref }}
+          SHA: ${{ steps.target.outputs.sha }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          # Both sides rewrite the same version lines (ours `X-kuitos.N`, theirs the next release),
+          # which would conflict on every sync. Align ours to upstream's version first, so both
+          # sides make the same change there, then move to `<upstream>-kuitos.1` after the merge.
+          set_version() {
+            python3 - "$1" <<'PY'
+          import re, sys
+          v = sys.argv[1]
+          for path in ("Cargo.toml", "herdr-plugin.toml"):
+              text = open(path).read()
+              open(path, "w").write(re.sub(r'(?m)^version = "[^"]*"', f'version = "{v}"', text, count=1))
+          text = open("Cargo.lock").read()
+          open("Cargo.lock", "w").write(
+              re.sub(r'(name = "herdr-reviewr"\nversion = )"[^"]*"', rf'\g<1>"{v}"', text, count=1))
+          PY
+          }
+          up="$(git show "${SHA}:herdr-plugin.toml" | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/')"
+          set_version "$up"
+          if ! git diff --quiet; then
+            git commit -qam "chore: align the version with upstream ${up} before merging"
+          fi
+          if git merge --no-ff --no-edit -m "Merge upstream ${REF}" "$SHA"; then
+            set_version "${up}-kuitos.1"
+            git commit -qam "chore: version ${up}-kuitos.1"
+            {
+              echo "result=clean"
+              echo "version=${up}-kuitos.1"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "result=conflict"
+              echo "files<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+          fi
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        if: steps.merge.outputs.result == 'clean'
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.merge.outputs.result == 'clean'
+
+      - name: Checks
+        id: checks
+        if: steps.merge.outputs.result == 'clean'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          {
+            cargo fmt --all --check &&
+            cargo clippy --all-targets --all-features -- -D warnings &&
+            cargo test --all-features
+          } 2>&1 | tee checks.log
+
+      - name: Report
+        if: steps.target.outputs.skip == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REF: ${{ steps.target.outputs.ref }}
+          SHA: ${{ steps.target.outputs.sha }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          RESULT: ${{ steps.merge.outputs.result }}
+          FILES: ${{ steps.merge.outputs.files }}
+          CHECKS: ${{ steps.checks.outcome }}
+          VERSION: ${{ steps.merge.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          short="${SHA:0:7}"
+          version="${VERSION%-kuitos.1}"
+          version="${version:-${REF#v}}"
+          if [ "$RESULT" = "conflict" ]; then
+            version_step="- [ ] Set \`version\` to \`${version}-kuitos.1\` in \`Cargo.toml\` and \`herdr-plugin.toml\` (\`cargo build\` refreshes \`Cargo.lock\`)."
+          else
+            version_step="- [ ] The PR already sets version \`${version}-kuitos.1\` in \`Cargo.toml\`, \`herdr-plugin.toml\` and \`Cargo.lock\`."
+          fi
+          release_steps="$(cat <<EOF
+          To release after merging:
+          ${version_step}
+          - [ ] Check \`CHANGELOG.md\`: it merges with the \`union\` driver, so upstream's and the fork's sections sit side by side; add a \`## [${version}-kuitos.1]\` section (the release workflow fails without one).
+          - [ ] Tag \`v${version}-kuitos.1\` on \`main\` and push the tag.
+          EOF
+          )"
+          if [ "$RESULT" = "conflict" ]; then
+            title="Merge upstream ${REF}: conflicts"
+            body="$(printf 'Merging upstream `%s` (%s) into `main` conflicts in:\n\n```\n%s\n```\n\nResolve locally:\n\n```sh\ngit fetch upstream --tags   # upstream = persiyanov/herdr-reviewr\ngit switch main && git pull\ngit merge %s   # resolve, run the checks, commit\n```\n\n%s\n\nRun: %s\n' "$REF" "$short" "$FILES" "$REF" "$release_steps" "$RUN_URL")"
+          else
+            if [ "$CHECKS" = "success" ]; then
+              title="Merge upstream ${REF}"
+              checks_line="fmt, clippy and \`cargo test --all-features\` pass on the merge."
+            else
+              title="Merge upstream ${REF} (checks fail)"
+              checks_line="The merge is clean but fmt, clippy or the tests fail on it; the log tail is below. Fix on this branch."
+            fi
+            tail_log="$(tail -n 40 checks.log 2>/dev/null || true)"
+            body="$(printf 'Merges upstream `%s` (%s) into `main`.\n\n%s\n\n<details><summary>checks log (tail)</summary>\n\n```\n%s\n```\n\n</details>\n\n%s\n\nRun: %s\n' "$REF" "$short" "$checks_line" "$tail_log" "$release_steps" "$RUN_URL")"
+          fi
+
+          {
+            echo "## ${title}"
+            echo
+            echo "$body"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: nothing pushed or opened."
+            exit 0
+          fi
+
+          if [ "$RESULT" = "conflict" ]; then
+            gh issue create --title "$title" --body "$body"
+          else
+            if ! git push --force-with-lease origin "$BRANCH"; then
+              # GITHUB_TOKEN may not push commits that touch .github/workflows, which an upstream
+              # release sometimes does. Hand the merge over instead.
+              gh issue create --title "Merge upstream ${REF}: merge locally" --body "$(printf 'The merge of upstream `%s` (%s) is clean, but this workflow could not push it (most likely upstream changed `.github/workflows/`, which GITHUB_TOKEN may not push).\n\nMerge locally:\n\n```sh\ngit fetch upstream --tags   # upstream = persiyanov/herdr-reviewr\ngit switch main && git pull\ngit merge %s\n```\n\n%s\n\nRun: %s\n' "$REF" "$short" "$REF" "$release_steps" "$RUN_URL")"
+              exit 0
+            fi
+            draft=""
+            [ "$CHECKS" = "success" ] || draft="--draft"
+            gh pr create --base main --head "$BRANCH" --title "$title" --body "$body" $draft
+          fi
