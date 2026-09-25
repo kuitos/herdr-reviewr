@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **A drag now keeps its selection for `c`.** A poll landing while the mouse button was down
+  blanked the settled highlight on release even when the text under it was unchanged, so after
+  nearly every real drag (anything longer than the poll interval) `c` commented the cursor line
+  instead of the span; only a double-click, too quick to meet a poll, worked. The release now
+  keeps the span when its text survived and blanks it only when that text changed.
+
 ## [0.39.0-kuitos.1] - 2026-09-25
 
 Fork of persiyanov/herdr-reviewr v0.39.0.

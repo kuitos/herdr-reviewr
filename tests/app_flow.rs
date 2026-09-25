@@ -6806,6 +6806,35 @@ fn comment_after_a_drag_quotes_the_span_and_anchors_to_its_line() {
 }
 
 #[test]
+fn a_poll_landing_mid_drag_keeps_the_span_for_c_unless_its_text_changed() {
+    // A real drag outlasts the poll interval, so a snapshot almost always lands while the
+    // button is down: the view reload is held and runs on release. An unchanged text must
+    // keep the settled span, or `c` falls back to the cursor line after every real drag.
+    let r = selection_repo();
+    let mut app = app_on(&r);
+    let (c6, r0) = sel_cell(&app, 0, 6);
+    let (c9, _) = sel_cell(&app, 0, 9);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c6, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c9, r0);
+    r.write("other.rs", "unrelated\n");
+    app.reload().unwrap();
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c9, r0);
+    assert_eq!(last_copy().as_deref(), Some("beta"));
+    assert!(app.settled_selection().is_some(), "the held reload left the spanned text alone");
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    assert_eq!(app.pending_location().as_deref(), Some("m.rs:1 · 「beta」"));
+    press(&mut app, &Keymap::default(), KeyCode::Esc);
+
+    // The spanned text changes while the button is down: the release blanks the highlight.
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c6, r0);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c9, r0);
+    r.write("m.rs", "alpha BETA\n\tif x {\n日本 z\n");
+    app.reload().unwrap();
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c9, r0);
+    assert!(app.settled_selection().is_none(), "changed spanned text blanks the highlight");
+}
+
+#[test]
 fn a_settled_span_advertises_comment_span_beside_its_copy_status() {
     let r = selection_repo();
     let mut app = app_on(&r);

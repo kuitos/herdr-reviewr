@@ -1442,25 +1442,8 @@ impl App {
         // alone and blanks when the text under it changed — stale never wrong
         // The `PR` surfaces land through the PR paint, and a
         // card's text is the in-memory comment's, which no poll moves.
-        if let Some((d, text)) = &self.settled_sel {
-            use crate::selection::Surface;
-            let (a, b) = d.ordered();
-            let same = match d.surface {
-                Surface::Read => crate::selection::read_text(&self.visible, a, b) == *text,
-                Surface::Files => {
-                    crate::selection::files_text(&self.file_rows, &self.entries, a.row, b.row)
-                        == *text
-                }
-                // The preview repaints whenever its source changed; the span's own painted
-                // rows are layout-side, so the source string is the comparable identity.
-                Surface::Painted if self.tab != Tab::Pr => {
-                    preview_before.as_deref() == Some(self.preview_text.as_str())
-                }
-                Surface::Painted | Surface::Card { .. } | Surface::PrNav => true,
-            };
-            if !same {
-                self.settled_sel = None;
-            }
+        if !self.settled_span_survives(preview_before.as_deref()) {
+            self.settled_sel = None;
         }
         // The open commit picker reads the same world: its list refreshes under the poll and
         // reconciles by sha.
@@ -3243,10 +3226,35 @@ impl App {
         // Skip (and drop the bit) when the gesture ended into the composer: the composing
         // freeze owns the view from here, and its own exit catches up.
         if std::mem::take(&mut self.view_reload_held) && !self.mode.is_modal() {
+            let preview_before = self.preview_text.clone();
             self.reload_open_view();
-            // The held reload rebuilds the text a just-settled span sits on, so the
-            // highlight could paint over content that was never copied — blank it
-            self.settled_sel = None;
+            // The held reload rebuilds the text a just-settled span sits on. A poll lands every
+            // couple of seconds whether or not anything changed, so nearly every real drag
+            // spans one: keep the span when the text under it survived (Continuity, as a
+            // poll's own land does), blank it only when that text changed.
+            if !self.settled_span_survives(Some(&preview_before)) {
+                self.settled_sel = None;
+            }
+        }
+    }
+
+    /// Whether the settled highlight still covers the text it copied: `Read` and `Files`
+    /// re-read their span; the preview compares its source (`preview_before`, the source the
+    /// span was painted over), since its painted rows are layout-side. `PR` surfaces land
+    /// through the PR paint and a card's text is the in-memory comment's, which no poll moves.
+    fn settled_span_survives(&self, preview_before: Option<&str>) -> bool {
+        use crate::selection::Surface;
+        let Some((d, text)) = &self.settled_sel else { return true };
+        let (a, b) = d.ordered();
+        match d.surface {
+            Surface::Read => crate::selection::read_text(&self.visible, a, b) == *text,
+            Surface::Files => {
+                crate::selection::files_text(&self.file_rows, &self.entries, a.row, b.row) == *text
+            }
+            Surface::Painted if self.tab != Tab::Pr => {
+                preview_before == Some(self.preview_text.as_str())
+            }
+            Surface::Painted | Surface::Card { .. } | Surface::PrNav => true,
         }
     }
 
