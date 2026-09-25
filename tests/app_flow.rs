@@ -2538,12 +2538,174 @@ fn deleting_the_last_listed_comment_clamps_the_list_cursor() {
 }
 
 #[test]
-fn a_non_repo_path_yields_an_empty_state_not_an_error() {
+fn a_non_repo_path_reloads_changes_to_the_not_a_repo_state_not_an_error() {
+    use herdr_reviewr::world::RepoKind;
     let dir = tempfile::tempdir().unwrap();
+    write_plain(dir.path(), "a.txt", "a\n");
     let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
     assert!(app.reload().is_ok(), "a non-repo reload is graceful, not an error");
-    assert!(app.entries.is_empty());
+    assert_eq!(app.repo_kind, RepoKind::Plain, "the build decided the directory is plain");
+    assert!(app.entries.is_empty(), "Changes has nothing to list outside a repo");
     assert!(app.diff.rows.is_empty());
+    assert_eq!(app.changed_count(), 0);
+}
+
+// --- A plain directory (no git) ------------------------------------------------
+
+/// Write `rel` under a plain (non-git) directory, creating its parents.
+fn write_plain(root: &Path, rel: &str, contents: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+/// An app over a plain directory as `run` starts one: on `All files`, loaded.
+fn plain_app(root: &Path) -> App {
+    let mut app = App::new(root.to_path_buf(), Scope::Uncommitted, None);
+    app.start_plain();
+    app.reload().unwrap();
+    app
+}
+
+#[test]
+fn all_files_lists_a_plain_directory_by_its_gitignore() {
+    use herdr_reviewr::app::Tab;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_plain(root, ".gitignore", "target/\n*.log\n");
+    write_plain(root, ".editorconfig", "root = true\n");
+    write_plain(root, "src/main.rs", "fn main() {}\n");
+    write_plain(root, "target/build.o", "x\n");
+    write_plain(root, "target/sub/y.o", "y\n");
+    write_plain(root, "run.log", "log\n");
+    let mut app = plain_app(root);
+    assert_eq!(app.tab, Tab::AllFiles);
+
+    let listed = |a: &App| -> Vec<(String, bool, bool)> {
+        a.entries.iter().map(|e| (e.path.clone(), e.ignored, e.is_dir)).collect()
+    };
+    assert_eq!(
+        listed(&app),
+        vec![
+            (".editorconfig".into(), false, false),
+            (".gitignore".into(), false, false),
+            ("run.log".into(), true, false),
+            ("src/main.rs".into(), false, false),
+            ("target".into(), true, true),
+        ],
+        "dotfiles list, .gitignore holds without a .git, an ignored dir is one placeholder"
+    );
+    assert_eq!(app.changed_count(), 0, "nothing is changed outside a repo");
+
+    // The ignored placeholder expands lazily, exactly as in a repo.
+    app.focus = Focus::Files;
+    app.file_cursor = app.file_rows.iter().position(|r| r.dir_path() == Some("target")).unwrap();
+    app.expand_dir();
+    assert!(app.entries.iter().any(|e| e.path == "target/build.o" && e.ignored));
+    assert!(app.entries.iter().any(|e| e.path == "target/sub" && e.is_dir));
+}
+
+#[test]
+fn a_plain_directory_views_comments_on_and_exports_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write_plain(dir.path(), "notes/a.md", "alpha\nbeta\ngamma\n");
+    let mut app = plain_app(dir.path());
+    let row = file_row_of(&app, "notes/a.md").expect("the file is listed");
+    app.select_file(row).unwrap();
+    assert_eq!(app.diff_path.as_deref(), Some("notes/a.md"), "the viewer opens it");
+    assert!(!app.visible.is_empty(), "its content is on screen");
+
+    app.focus = Focus::Diff;
+    app.diff_cursor = 1; // "beta"
+    app.start_comment();
+    typed(&mut app, "why");
+    app.submit_comment();
+    let c = app.store.get(0).expect("a comment was made").clone();
+    assert!(!c.diff_anchored, "an All files comment is content-anchored");
+
+    app.reload().unwrap();
+    assert!(!app.is_stale(&c), "a comment on an existing file is live");
+    let target = FakeTarget::ok();
+    assert!(app.export(&target));
+    let out = target.last();
+    assert!(out.contains("notes/a.md:2"), "header is path:line:\n{out}");
+    assert!(out.contains(" beta"), "the snippet is the commented line:\n{out}");
+
+    // A second comment, then the file goes: the comment survives, stale.
+    let row = file_row_of(&app, "notes/a.md").unwrap();
+    app.select_file(row).unwrap();
+    app.focus = Focus::Diff;
+    app.diff_cursor = 0;
+    app.start_comment();
+    typed(&mut app, "gone");
+    app.submit_comment();
+    let c = app.store.get(0).expect("the comment was made").clone();
+    std::fs::remove_file(dir.path().join("notes/a.md")).unwrap();
+    app.reload().unwrap();
+    assert!(app.is_stale(&c), "it goes stale once its file is deleted");
+    assert_eq!(app.store.len(), 1, "and is never dropped");
+}
+
+#[test]
+fn git_only_actions_are_inert_in_a_plain_directory() {
+    use herdr_reviewr::app::{NOT_A_REPO, Tab};
+    let dir = tempfile::tempdir().unwrap();
+    write_plain(dir.path(), "a.txt", "a\n");
+    let mut app = plain_app(dir.path());
+
+    app.set_tab(Tab::Pr).unwrap();
+    assert_eq!(app.tab, Tab::AllFiles, "the PR tab does not open outside a repo");
+    assert_eq!(app.status, NOT_A_REPO);
+
+    app.status.clear();
+    app.set_scope(Scope::Branch).unwrap();
+    assert_eq!(app.scope, Scope::Uncommitted, "the scope is git-only");
+    assert_eq!(app.status, NOT_A_REPO);
+
+    for open in [App::open_base_picker, App::open_commit_picker] {
+        app.status.clear();
+        open(&mut app);
+        assert_eq!(app.mode, Mode::Normal, "no picker opens");
+        assert_eq!(app.status, NOT_A_REPO, "the status says why, not a git error");
+    }
+
+    // `Changes` still opens — to its not-a-repo state.
+    enter_tab(&mut app, Tab::Changes);
+    assert_eq!(app.tab, Tab::Changes);
+    assert!(app.entries.is_empty());
+}
+
+#[test]
+fn a_plain_directory_that_becomes_a_repo_starts_showing_changes() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::world::RepoKind;
+    let dir = tempfile::tempdir().unwrap();
+    write_plain(dir.path(), "a.rs", "one\n");
+    let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
+    app.reload().unwrap();
+    assert_eq!(app.repo_kind, RepoKind::Plain);
+    assert!(app.entries.is_empty());
+
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+    write_plain(dir.path(), "a.rs", "two\n");
+
+    app.reload().unwrap();
+    assert_eq!(app.repo_kind, RepoKind::Git, "the next build sees the repo");
+    assert_eq!(app.tab, Tab::Changes);
+    assert_eq!(app.changed_count(), 1);
+    assert!(file_row_of(&app, "a.rs").is_some(), "the edit shows on Changes");
 }
 
 #[test]
@@ -4545,12 +4707,22 @@ fn a_landing_world_result_never_flips_the_hidden_navigator() {
 }
 
 #[test]
-fn outside_a_repo_the_build_yields_the_quiet_empty_snapshot() {
+fn outside_a_repo_the_build_lists_files_but_no_changes() {
+    use herdr_reviewr::world::RepoKind;
     let dir = tempfile::tempdir().unwrap();
-    let app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
     let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
-    assert!(snapshot.entries.is_empty(), "no error, no entries — the empty state stays quiet");
+    assert_eq!(snapshot.repo_kind, RepoKind::Plain);
+    assert!(snapshot.entries.is_empty(), "no error, no changes — Changes stays quiet");
+    assert!(snapshot.head.is_none());
     assert!(herdr_reviewr::world::build_changed(&app.world_input()).unwrap().changed.is_empty());
+
+    app.start_plain();
+    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let paths: Vec<&str> = snapshot.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["a.txt"], "All files walks the directory");
+    assert!(!snapshot.listing_capped);
 }
 
 #[test]
@@ -5317,6 +5489,58 @@ mod search_overlay {
             cache.path().join("frecency").exists(),
             "the frecency store lives under the cache dir"
         );
+    }
+
+    /// The engine outside git: a plain directory has no index, and search still finds its
+    /// files by path and by content, and writes nothing there.
+    #[test]
+    fn engine_searches_a_plain_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/alpha.rs"), "fn a() { beta_marker(); }\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "beta_marker, ignored\n").unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let before = all_paths(dir.path());
+
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let worker = herdr_reviewr::search::spawn(
+            dir.path().to_path_buf(),
+            cache.path().into(),
+            job_rx,
+            res_tx,
+        );
+        let query = |generation: u64, query: &str| {
+            job_tx.send(SearchJob::Query { generation, query: query.into() }).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let completion = res_rx
+                    .recv_timeout(deadline - std::time::Instant::now())
+                    .expect("the worker answers before the deadline");
+                match completion.outcome {
+                    SearchOutcome::Ready(results) if completion.generation == generation => {
+                        break results;
+                    }
+                    SearchOutcome::Failed(e) => panic!("the engine failed outside git: {e}"),
+                    _ => {}
+                }
+            }
+        };
+
+        let by_path = query(1, "alpha");
+        let files: Vec<&str> = by_path.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(files.contains(&"src/alpha.rs"), "a path query finds the file: {files:?}");
+        let by_content = query(2, "beta_marker");
+        let code: Vec<&str> = by_content.code.iter().map(|c| c.path.as_str()).collect();
+        // Not asserted either way: fff-search's own walker applies `.gitignore` only inside a
+        // repo, so outside one `ignored.txt` is searchable too (the `All files` tree still
+        // dims it). That is the engine's rule, not reviewr's.
+        assert!(code.contains(&"src/alpha.rs"), "a content query finds the line: {code:?}");
+
+        drop(job_tx);
+        worker.join().unwrap();
+        assert_eq!(all_paths(dir.path()), before, "search writes nothing to the directory");
     }
 }
 

@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **reviewr opens in a directory that is not a git repository.** **All files** lists it
+  (honoring `.gitignore`), and the viewer, line comments, and search work as in a repo.
+  **Changes** says `not a git repository` and points at **Files**, which is where such a pane
+  opens; the scope, its pickers, and the **PR** tab stay inert with the same note. The
+  listing stops at 20,000 entries and says so. `git init` there turns **Changes** on without
+  reopening the pane. The herdr actions now open on any existing directory, still preferring
+  a git repo when the live and launch directories differ.
+
 ## [0.39.0] — 2026-09-23
 
 ### Added

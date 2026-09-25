@@ -232,8 +232,11 @@ esac
 
 # Opening from here on. Prefer the focused pane's live `foreground_cwd`, read from the
 # pane-list snapshot already in hand, over the context's launch cwd (the launch-vs-live split is docs/herdr-api-notes.md). The mode guard
-# keeps auto-open on the event payload's cwd set above.
+# keeps auto-open on the event payload's cwd set above. A git repo wins over a plain
+# directory, so a shell that wandered out of the repo still opens on it; a plain directory
+# still opens (reviewr shows its files), and only a missing one refuses.
 is_git_repo() { [ -n "$1" ] && git -C "$1" rev-parse --show-toplevel >/dev/null 2>&1; }
+is_dir() { [ -n "$1" ] && [ -d "$1" ]; }
 live=""
 if [ "$mode" != auto-open ] && [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
   fp=$(printf '%s' "$HERDR_PLUGIN_CONTEXT_JSON" | jq -r '.focused_pane_id // empty' 2>/dev/null)
@@ -242,10 +245,14 @@ if [ "$mode" != auto-open ] && [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
 fi
 if is_git_repo "$live"; then
   cwd="$live"
-elif ! is_git_repo "$cwd"; then
+elif is_git_repo "$cwd"; then
+  :
+elif is_dir "$live"; then
+  cwd="$live"
+elif ! is_dir "$cwd"; then
   # Name every candidate the check rejected, or a refusal over an inspected-but-unusable
   # live cwd would read as if no directory was ever tried.
-  refuse "not a git repo: '${cwd:-<no cwd>}'${live:+ (live cwd '$live')}"
+  refuse "no directory to open: '${cwd:-<no cwd>}'${live:+ (live cwd '$live')}"
 fi
 
 # A manual open takes focus. The event never does.

@@ -30,6 +30,7 @@ use crate::keymap::Keymap;
 use crate::model::{ChangeKind, Comment};
 use crate::snippet::{snippet_caption_sign, snippet_row_is_comment};
 use crate::theme::Palette;
+use crate::world::RepoKind;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -1297,6 +1298,14 @@ pub fn hit_header(area: Rect, app: &App, keymap: &Keymap, col: u16, row: u16) ->
     None
 }
 
+/// The `Changes` tab's empty state in a plain directory, pointing at the tab that works
+/// there by its bound key and its tab label. Two lines, so the narrow navigator never clips
+/// the hint.
+fn not_a_repo_message(keymap: &Keymap) -> String {
+    let key = keymap.hint(crate::keymap::Action::TabAllFiles).label();
+    format!("{}\npress {key} for Files", crate::app::NOT_A_REPO)
+}
+
 /// The three tabs and their labels, left to right, each led by its `tab-*` action's hint key
 /// Column math uses display width, since a bound hint key can be wide.
 fn tab_labels(keymap: &Keymap) -> [(Tab, String); 3] {
@@ -1352,6 +1361,10 @@ fn scope_chip(app: &App) -> String {
 /// The `branch` scope's base label as `(lead, shown, marker, tail)`.
 /// `shown` is the spelling or a SHA-once abbrev. `marker` is ` (sha)` for a named rev.
 fn base_label(app: &App) -> Option<(String, String, String, String)> {
+    // A plain directory has no base to name, and the label would click into a git picker.
+    if app.repo_kind == RepoKind::Plain {
+        return None;
+    }
     if app.scope == crate::model::Scope::Commits {
         return pick_label(app);
     }
@@ -1469,6 +1482,9 @@ fn tab_bar_spans(app: &App) -> Vec<Span<'static>> {
         }
         let style = if tab == app.tab {
             bar.fg(p.blue).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if tab == Tab::Pr && app.repo_kind == RepoKind::Plain {
+            // Inert outside a repo: recedes like the header's secondary text.
+            bar.fg(p.dim2)
         } else {
             bar.fg(p.dim0)
         };
@@ -1500,7 +1516,13 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let bar = Style::default().bg(p.surface0);
     let mut spans = tab_bar_spans(app);
-    spans.push(Span::styled(chip, bar.fg(p.yellow).add_modifier(Modifier::BOLD)));
+    // The scope is git-only: outside a repo the chip recedes rather than read as a button.
+    let chip_style = if app.repo_kind == RepoKind::Plain {
+        bar.fg(p.dim2)
+    } else {
+        bar.fg(p.yellow).add_modifier(Modifier::BOLD)
+    };
+    spans.push(Span::styled(chip, chip_style));
     if let Some((lead, name, tail)) = base {
         // An empty lead is the `no base` state, worn as a warning, except in `commits`,
         // whose pick label always leaves the lead empty and is never a warning. A resolved
@@ -1542,8 +1564,10 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.file_rows.is_empty() {
         let gone = app.commits_gone_message();
+        let plain = not_a_repo_message(app.keymap());
         let msg = match app.tab {
             Tab::AllFiles => "no files",
+            Tab::Changes if app.repo_kind == RepoKind::Plain => plain.as_str(),
             Tab::Changes if app.awaiting_turn() => app.turn_wait_message(),
             Tab::Changes if app.commits_gone() => gone.as_str(),
             _ => "no changes",

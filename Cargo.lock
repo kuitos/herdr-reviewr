@@ -902,6 +902,7 @@ dependencies = [
  "anyhow",
  "dirs 7.0.0",
  "fff-search",
+ "ignore",
  "neo_frizbee",
  "pulldown-cmark",
  "ratatui",

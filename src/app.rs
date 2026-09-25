@@ -21,7 +21,11 @@ use crate::highlight::Highlighter;
 use crate::logln;
 use crate::model::{Comment, CommentStore, CommitPick, Rev, Scope, Side};
 use crate::theme::{self, Palette};
-use crate::world::{PickStatus, PickVerdict};
+use crate::world::{PickStatus, PickVerdict, RepoKind};
+
+/// The status a git-only action answers with in a plain directory, instead of the git error
+/// it would otherwise surface.
+pub const NOT_A_REPO: &str = "not a git repository";
 
 /// Navigator shares and bounds, as percentages of the body's split axis.
 const DEFAULT_SIDE_PCT: u16 = 32;
@@ -650,6 +654,12 @@ pub struct App {
     /// fails the landing's input match instead of reverting the pick (`crate::world::WorldInput`).
     base_epoch: u64,
     pub scope: Scope,
+    /// Whether the reviewed directory is a git worktree, from the latest landed snapshot. A
+    /// plain directory has only `All files`; the git-only surfaces answer [`NOT_A_REPO`].
+    pub repo_kind: RepoKind,
+    /// Whether the last `All files` listing stopped at the walk's cap, so the status line
+    /// reports the cap once per capped stretch rather than on every poll.
+    listing_capped: bool,
     /// The active tab; it drives both panes and selects the per-tab state in play.
     pub tab: Tab,
     /// Which file tab (`Changes`/`AllFiles`) currently occupies the diff/file fields. Tracked
@@ -922,6 +932,8 @@ impl App {
             commit_picker: None,
             base_epoch: 0,
             scope,
+            repo_kind: RepoKind::Git,
+            listing_capped: false,
             tab: Tab::Changes,
             active_file_tab: Tab::Changes,
             focus: Focus::Files,
@@ -1291,21 +1303,9 @@ impl App {
         if !self.tab.is_file_tab() {
             return Ok(());
         }
-        // Outside a git repo, show an empty state rather than failing.
-        if !git::is_repo(&self.repo) {
-            self.entries.clear();
-            self.changed.clear();
-            self.file_rows.clear();
-            self.file_cursor = 0;
-            self.file_scroll = 0;
-            if !self.composing() {
-                self.diff = FileDiff::empty();
-                self.diff_path = None;
-                self.visible.clear(); // keep `visible` mirroring `diff` so no stale rows paint
-                self.reset_diff_view();
-            }
-            return Ok(());
-        }
+        // Outside a git repo the build lists `All files` from the filesystem and leaves
+        // `Changes` empty; reconciling that empty set blanks its read pane (Continuity: the
+        // identity changed).
         let snapshot = crate::world::build(&self.world_input())?;
         self.reconcile_world(snapshot);
         Ok(())
@@ -1371,6 +1371,13 @@ impl App {
         // file, then the first file. The toggled-directory set survives untouched.
         let anchor = self.cursor_anchor();
         let open = self.diff_path.clone();
+        self.repo_kind = snapshot.repo_kind;
+        if self.tab == Tab::AllFiles {
+            if snapshot.listing_capped && !self.listing_capped {
+                self.status = format!("listing stopped at {} files", crate::walk::LISTING_CAP);
+            }
+            self.listing_capped = snapshot.listing_capped;
+        }
         self.changed = snapshot.changed;
         self.entries = snapshot.entries;
         self.adopt_branch_base(snapshot.branch_base);
@@ -2326,10 +2333,32 @@ impl App {
         next
     }
 
+    /// Whether the reviewed directory is plain, answering the git-only action the caller is
+    /// about to refuse with [`NOT_A_REPO`] on the status line instead of a git error.
+    fn refuse_outside_git(&mut self) -> bool {
+        let plain = self.repo_kind == RepoKind::Plain;
+        if plain {
+            self.status = NOT_A_REPO.to_string();
+        }
+        plain
+    }
+
+    /// Open on `All files` in a directory already known to be plain, before anything loads:
+    /// `Changes` has nothing to show there. Startup only — later the tab moves only under
+    /// the user's own input, even if the directory's kind changes (Continuity).
+    pub fn start_plain(&mut self) {
+        self.repo_kind = RepoKind::Plain;
+        self.tab = Tab::AllFiles;
+        self.active_file_tab = Tab::AllFiles;
+    }
+
     /// Switch the changeset scope and reload. A no-op while composing, so a comment
     /// in progress is never stranded against a different diff.
     pub fn set_scope(&mut self, scope: Scope) -> Result<()> {
         self.ensure_config_ready()?;
+        if self.refuse_outside_git() {
+            return Ok(());
+        }
         // `commits` with no pick, or a `gone` one, has nothing to show: the picker opens
         // instead, without switching, so `esc` leaves this scope active.
         if scope == Scope::Commits
@@ -2406,6 +2435,9 @@ impl App {
     pub fn set_tab(&mut self, tab: Tab) -> Result<()> {
         self.ensure_config_ready()?;
         if self.tab == tab || self.composing() {
+            return Ok(());
+        }
+        if tab == Tab::Pr && self.refuse_outside_git() {
             return Ok(());
         }
         self.tab = tab;
@@ -3023,7 +3055,8 @@ impl App {
         // In `All files`, expanding an ignored directory loads its children lazily, so the
         // entry set is rebuilt before the rows. Other tabs just re-flatten.
         if self.tab == Tab::AllFiles
-            && let Ok(entries) = crate::world::all_files_entries(&self.world_input(), &self.changed)
+            && let Ok((entries, _)) =
+                crate::world::all_files_entries(&self.world_input(), self.repo_kind, &self.changed)
         {
             self.entries = entries;
         }
@@ -4588,7 +4621,7 @@ impl App {
     /// on the current base, else the first row. Still opens when that list is empty, so a
     /// revision can be typed.
     pub fn open_base_picker(&mut self) {
-        if !self.base_pick_available() || self.mode != Mode::Normal {
+        if !self.base_pick_available() || self.mode != Mode::Normal || self.refuse_outside_git() {
             return;
         }
         // The base is re-resolved here, not read from `branch_base`: that lands only while
@@ -4710,7 +4743,7 @@ impl App {
     /// highlight on the pick's newest commit else the first row, and the anchor on the
     /// oldest for a run of two or more. Inert off the file tabs and under any other overlay.
     pub fn open_commit_picker(&mut self) {
-        if !self.tab.is_file_tab() || self.mode != Mode::Normal {
+        if !self.tab.is_file_tab() || self.mode != Mode::Normal || self.refuse_outside_git() {
             return;
         }
         let mut picker = match self.list_commit_rows() {

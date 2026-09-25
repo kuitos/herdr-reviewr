@@ -15,6 +15,9 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 dirs = "7"
 fff-search = "0.11.0"
+# The `All files` walk outside a git repo, honoring `.gitignore` like `ls-files` would. Already
+# in the tree through fff-search, so it adds no crate.
+ignore = "0.4.33"
 # The matcher fff-search scores with: the base picker ranks branch names by the same rule
 # as the search screen, over a plain string list.
 neo_frizbee = "0.13.3"

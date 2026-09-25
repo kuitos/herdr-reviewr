@@ -34,7 +34,7 @@ GitLab, or Azure DevOps and never posts.
 ## Requirements
 
 - **herdr ≥ 0.7.5** (the plugin system).
-- **git** on `PATH`.
+- **git** on `PATH`. A directory outside any git repository opens too, with **All files** only.
 - A **truecolor** terminal with Unicode box-drawing.
 - **macOS or Linux.**
 - **`gh`** (GitHub), **`glab`** (GitLab), or **`az`** (Azure DevOps, with the `azure-devops` extension), authenticated. Only the **PR** tab needs one.
@@ -459,6 +459,15 @@ The known constraints:
 - **Mirrors the branch's *open* PR or MR** — merged or closed shows as history. Each comment
   surface caps at its newest 100 rows, with a `+more` marker naming the forge when there is
   more.
+
+**Outside a git repository**
+- **All files only** — the file tree, the viewer, line comments, and search work in any
+  directory, and the tree honors `.gitignore` files. **Changes**, the scope, and the **PR**
+  tab need a repo; they say `not a git repository` instead. A `git init` there turns them
+  on without reopening the pane.
+- **The tree stops at 20,000 entries**, so pointing reviewr at a huge directory (your home)
+  stays responsive; the status line says when it stopped. Search is fff-search's own index,
+  which applies `.gitignore` only inside a repo.
 
 **Review model**
 - **Comments are in-memory and single-session** — closing the pane loses any you haven't sent

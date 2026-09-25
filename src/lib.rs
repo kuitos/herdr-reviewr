@@ -33,6 +33,7 @@ pub mod snippet;
 pub mod theme;
 pub mod turn;
 pub mod ui;
+pub mod walk;
 pub mod world;
 
 use std::io;
@@ -335,10 +336,19 @@ fn invalidate_screen(terminal: &mut DefaultTerminal) -> Result<()> {
 /// the baseline ref off it independently, and turn membership compares resolved top levels
 /// against it.
 ///
-/// A non-repo path is not an error — the pane opens to an empty state and starts showing
-/// changes if the directory becomes a repo.
-fn repo_root(cfg: &Config) -> std::path::PathBuf {
-    git::toplevel(&cfg.repo).unwrap_or_else(|| cfg.repo.clone())
+/// A non-repo path is not an error — the pane opens on `All files` and starts showing
+/// changes if the directory becomes a repo. It is canonicalized, as git spells a top level,
+/// so the spelling still matches once `git init` makes it one. The second value is git's
+/// verdict on the path, `None` when git could not run.
+fn repo_root(cfg: &Config) -> (std::path::PathBuf, Option<crate::world::RepoKind>) {
+    use crate::world::RepoKind;
+    match git::worktree_of(&cfg.repo) {
+        git::Worktree::Root(root) => (root, Some(RepoKind::Git)),
+        verdict => {
+            let path = std::fs::canonicalize(&cfg.repo).unwrap_or_else(|_| cfg.repo.clone());
+            (path, (verdict == git::Worktree::Outside).then_some(RepoKind::Plain))
+        }
+    }
 }
 
 /// The startup app for one config snapshot: ready on `Ok`, blocked with the error on
@@ -348,7 +358,7 @@ fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginCon
     match initial_config {
         Ok(plugin_config) => ready_app(cfg, plugin_config.clone()),
         Err(error) => {
-            let mut app = App::blocked(repo_root(cfg), Scope::Uncommitted, cfg.base.clone());
+            let mut app = App::blocked(repo_root(cfg).0, Scope::Uncommitted, cfg.base.clone());
             app.set_config_error(error.to_string());
             app
         }
@@ -357,7 +367,7 @@ fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginCon
 
 /// Build a fresh working reviewr pane only after the plugin configuration has validated.
 fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
-    let repo = repo_root(cfg);
+    let (repo, kind) = repo_root(cfg);
     let scope = plugin_config.default_scope();
     logln!(
         "start repo={} poll={:?} base={:?} scope={}",
@@ -367,6 +377,11 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
         scope.name()
     );
     let mut app = App::new(repo, scope, cfg.base.clone());
+    // A plain directory opens on `All files`, the one tab with anything to show. Git that
+    // could not run is no verdict, so the pane opens as usual.
+    if kind == Some(crate::world::RepoKind::Plain) {
+        app.start_plain();
+    }
     app.set_plugin_config(plugin_config);
     app.set_cli_theme(cfg.theme.clone());
     if let Some(wrap) = cfg.wrap {
@@ -3433,6 +3448,14 @@ mod refresh_tests {
     #[test]
     fn default_scope_seeds_a_fresh_pane_and_a_reread_never_switches_it() {
         let repo = tempfile::tempdir().unwrap();
+        // A repo: the scope is git-only, and a plain directory refuses the switch.
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success());
         let config_dir = tempfile::tempdir().unwrap();
         let path = config_dir.path().join("config.toml");
         std::fs::write(&path, "default_scope = \"branch\"\n").unwrap();
@@ -3456,6 +3479,37 @@ mod refresh_tests {
         ));
         assert_eq!(app.scope, Scope::LastTurn, "a reread never switches the active scope");
         assert_eq!(epoch, 0, "a default_scope change invalidates no running work");
+    }
+
+    #[test]
+    fn a_plain_startup_directory_opens_on_all_files_and_a_repo_on_changes() {
+        use crate::app::Tab;
+        use crate::world::RepoKind;
+        let plain = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::parse([plain.path().display().to_string()]);
+        let mut app = ready_app(&cfg, plugin_config_in(config_dir.path()).unwrap());
+        assert_eq!(app.tab, Tab::AllFiles, "a plain directory opens where its files are");
+        assert_eq!(app.repo_kind, RepoKind::Plain, "the first frame already knows");
+        app.reload().unwrap();
+        assert_eq!(app.tab, Tab::AllFiles, "the first load keeps the startup tab");
+        // The user's own switch stands: nothing moves them back.
+        app.set_tab(Tab::Changes).unwrap();
+        app.reload().unwrap();
+        assert_eq!(app.tab, Tab::Changes);
+
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let cfg = Config::parse([repo.path().display().to_string()]);
+        let app = ready_app(&cfg, plugin_config_in(config_dir.path()).unwrap());
+        assert_eq!(app.tab, Tab::Changes, "a repo opens on its changes");
+        assert_eq!(app.repo_kind, RepoKind::Git);
     }
 
     #[test]

@@ -56,6 +56,34 @@ pub struct WorldSnapshot {
     /// The commit `HEAD` named when the build ran, the commit picker's universe key
     /// `None` in an unborn repository.
     pub head: Option<String>,
+    /// Whether the reviewed directory was a git worktree when the build ran. Decided every
+    /// build, so a directory that becomes a repo starts showing changes.
+    pub repo_kind: RepoKind,
+    /// The plain-directory walk stopped at [`crate::walk::LISTING_CAP`], so the `All files`
+    /// tree is partial.
+    pub listing_capped: bool,
+}
+
+/// What kind of directory is under review. A plain directory has no changes to show: only
+/// `All files` works there, and the git-only surfaces (the `PR` tab, the scope and its
+/// pickers) stay inert.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepoKind {
+    #[default]
+    Git,
+    Plain,
+}
+
+impl RepoKind {
+    /// The kind `git rev-parse` determined, or `None` when git could not run — the absence
+    /// of a verdict, which a caller holds on rather than reading as `Plain`.
+    pub fn of(path: &Path) -> Option<Self> {
+        match git::worktree_of(path) {
+            git::Worktree::Root(_) => Some(RepoKind::Git),
+            git::Worktree::Outside => Some(RepoKind::Plain),
+            git::Worktree::Unknown => None,
+        }
+    }
 }
 
 /// What one build found the commit pick to be.
@@ -91,28 +119,42 @@ pub struct ScopeBuild {
 /// header count and comment staleness stay correct while `All files` lists the whole
 /// worktree. In `last-turn` with no baseline yet, the changeset is empty until a turn
 /// start is observed.
+///
+/// Outside a git repo the changeset is empty and `All files` walks the directory, so a plain
+/// directory paints its files rather than a failing status line every poll. When git cannot
+/// run at all the build fails, keeping the last frame, rather than guessing the directory is
+/// plain.
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
-    // Outside a git repo, an empty snapshot paints the quiet empty state rather than a
-    // failing status line every poll.
-    if !git::is_repo(&input.repo) {
-        return Ok(WorldSnapshot {
-            changed: HashMap::new(),
-            entries: Vec::new(),
-            branch_base: git::BaseStatus::default(),
-            pick_status: None,
-            head: None,
-        });
-    }
-    let ScopeBuild { branch_base, pick_status, changed } = build_changed(input)?;
-    let head = git::head_oid(&input.repo);
-    let changed_map = annotate(&changed);
-    let entries = match input.tab {
-        // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
-        Tab::AllFiles => all_files_entries(input, &changed_map)?,
-        // `Changes` (the `PR` tab never builds a snapshot).
-        _ => changed.iter().map(Entry::from_changed).collect(),
+    let Some(repo_kind) = RepoKind::of(&input.repo) else {
+        anyhow::bail!("git could not run");
     };
-    Ok(WorldSnapshot { changed: changed_map, entries, branch_base, pick_status, head })
+    let (ScopeBuild { branch_base, pick_status, changed }, head) = match repo_kind {
+        RepoKind::Git => (build_changed(input)?, git::head_oid(&input.repo)),
+        RepoKind::Plain => (
+            ScopeBuild {
+                branch_base: git::BaseStatus::default(),
+                pick_status: None,
+                changed: Vec::new(),
+            },
+            None,
+        ),
+    };
+    let changed_map = annotate(&changed);
+    let (entries, listing_capped) = match input.tab {
+        // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
+        Tab::AllFiles => all_files_entries(input, repo_kind, &changed_map)?,
+        // `Changes` (the `PR` tab never builds a snapshot).
+        _ => (changed.iter().map(Entry::from_changed).collect(), false),
+    };
+    Ok(WorldSnapshot {
+        changed: changed_map,
+        entries,
+        branch_base,
+        pick_status,
+        head,
+        repo_kind,
+        listing_capped,
+    })
 }
 
 /// The active scope's changed files and, on the `branch` scope, the base they diff against —
@@ -208,10 +250,13 @@ pub fn seed_baseline(repo: &std::path::Path) -> Option<String> {
 /// The `All files` entries: every worktree path (ignored dimmed), with the children of
 /// expanded ignored directories loaded lazily. Only directories the
 /// user has expanded are walked, so the cost tracks what is on screen, not the whole tree.
+/// A git worktree lists through `ls-files`, a plain directory through [`crate::walk`];
+/// the flag is whether that walk stopped at its cap.
 pub(crate) fn all_files_entries(
     input: &WorldInput,
+    kind: RepoKind,
     changed: &HashMap<String, Annotation>,
-) -> Result<Vec<Entry>> {
+) -> Result<(Vec<Entry>, bool)> {
     let to_entry = |w: git::WorktreeEntry| Entry {
         annotation: changed.get(&w.path).cloned(),
         path: w.path,
@@ -219,7 +264,14 @@ pub(crate) fn all_files_entries(
         ignored: w.ignored,
         is_dir: w.is_dir,
     };
-    let mut entries: Vec<Entry> = git::all_files(&input.repo)?.into_iter().map(&to_entry).collect();
+    let (listed, capped) = match kind {
+        RepoKind::Git => (git::all_files(&input.repo)?, false),
+        RepoKind::Plain => {
+            let listing = crate::walk::plain_files(&input.repo, crate::walk::LISTING_CAP)?;
+            (listing.entries, listing.capped)
+        }
+    };
+    let mut entries: Vec<Entry> = listed.into_iter().map(&to_entry).collect();
     let mut i = 0;
     while i < entries.len() {
         if entries[i].is_dir && input.toggled_dirs.contains(&entries[i].path) {
@@ -229,7 +281,7 @@ pub(crate) fn all_files_entries(
         }
         i += 1;
     }
-    Ok(entries)
+    Ok((entries, capped))
 }
 
 /// Turn tracking, owned by the worker: the sample, the snapshot capture, and the baseline
@@ -432,7 +484,8 @@ pub struct WorldCompletion {
 
 /// Run the world worker until the request channel closes. The latest request wins: queued
 /// requests coalesce into the newest, keeping any superseded job's sample and reveal flags
-/// so a poll's status sample is never skipped.
+/// so a poll's status sample is never skipped — except outside a git repo, where no agent can
+/// be a member and the poll samples nothing.
 pub fn spawn(
     mut host: TurnHost,
     rx: Receiver<WorldJob>,
@@ -441,6 +494,9 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("world".into())
         .spawn(move || {
+            // Whether the last build found a plain directory. No agent there can be a member
+            // of a worktree, so its polls skip the sample and its per-agent git calls.
+            let mut plain = false;
             while let Ok(mut job) = rx.recv() {
                 while let Ok(next) = rx.try_recv() {
                     job = WorldJob {
@@ -449,9 +505,12 @@ pub fn spawn(
                         ..next
                     };
                 }
-                let turn = job.sample_turn.then(|| host.sample());
+                let turn = (job.sample_turn && !plain).then(|| host.sample());
                 job.input.turn_baseline = host.baseline().map(str::to_string);
                 let snapshot = job.input.tab.is_file_tab().then(|| build(&job.input));
+                if let Some(Ok(built)) = &snapshot {
+                    plain = built.repo_kind == RepoKind::Plain;
+                }
                 let completion = WorldCompletion {
                     generation: job.generation,
                     input: job.input,

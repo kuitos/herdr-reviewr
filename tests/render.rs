@@ -322,6 +322,23 @@ fn the_file_list_renders_as_a_directory_tree() {
 }
 
 #[test]
+fn changes_in_a_plain_directory_points_at_all_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    let mut app = App::new(dir.path().to_path_buf(), Scope::Branch, None);
+    app.reload().unwrap();
+    let out = render(&app);
+    let hint = Keymap::default().hint(herdr_reviewr::keymap::Action::TabAllFiles).label();
+    let files_pane = right_column(&out, 30);
+    assert!(files_pane.contains("not a git repository"), "the empty state says why: {out}");
+    assert!(
+        files_pane.contains(&format!("press {hint} for Files")),
+        "and names the tab that works, by its key: {out}"
+    );
+    assert!(!out.contains("no base"), "no base label outside a repo: {out}");
+}
+
+#[test]
 fn an_expanded_directory_nests_its_children() {
     // All files paints unchanged rows without a marker. Those two columns must still
     // hold the chevron's width, or child names line up with the parent.

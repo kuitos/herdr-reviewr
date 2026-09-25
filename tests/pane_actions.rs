@@ -652,8 +652,8 @@ fn tab_placement_open_names_its_fresh_tab() {
 fn open_prefers_the_focused_panes_live_foreground_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let (herdr, log) = fake_herdr(dir.path());
-    // The launch cwd is not a git repo: an open that trusted it would refuse. The pane's
-    // live foreground cwd is the reviewed repo — the `claude -w <worktree>` shape, where
+    // The launch cwd is a plain directory: an open that trusted it would review no repo
+    // when one is in reach. The pane's live foreground cwd is the reviewed repo — the `claude -w <worktree>` shape, where
     // the agent chdirs into the worktree only inside its own process after launching
     // from the main checkout. The live cwd comes from the pane-list snapshot, so the
     // open pays no extra herdr call.
@@ -786,24 +786,79 @@ fn open_takes_the_focused_panes_cwd_not_another_panes() {
 }
 
 #[test]
-fn a_refusal_names_the_rejected_live_cwd_too() {
+fn a_plain_live_cwd_opens_when_no_repo_is_in_reach() {
     let dir = tempfile::tempdir().unwrap();
-    let (herdr, _log) = fake_herdr(dir.path());
-    // No context cwd and a non-repo live cwd: the open refuses, and the one stderr line
-    // names the live directory it inspected and rejected — a refusal that hid it would
-    // read as if no directory was ever tried.
+    let (herdr, log) = fake_herdr(dir.path());
+    // No context cwd and a live cwd outside any repo: reviewr works in a plain directory
+    // (its files, no changes), so the open takes it rather than refusing.
     let context = serde_json::json!({"focused_pane_id": "w1:p1"}).to_string();
     pane_with_cwd(dir.path(), "w1:p1", dir.path());
 
     let output = run_with_context("open", dir.path(), &herdr, &context);
 
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains(&format!("--cwd {}", dir.path().display())),
+        "the open must use the plain live cwd: {calls}"
+    );
+}
+
+#[test]
+fn a_plain_context_cwd_opens_when_the_live_cwd_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let plain = dir.path().join("plain");
+    fs::create_dir(&plain).unwrap();
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p1",
+        "focused_pane_cwd": plain,
+    })
+    .to_string();
+    pane_with_cwd(dir.path(), "w1:p1", &dir.path().join("deleted"));
+
+    let output = run_with_context("open", dir.path(), &herdr, &context);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains(&format!("--cwd {}", plain.display())),
+        "a missing live cwd falls back to the existing context cwd: {calls}"
+    );
+}
+
+#[test]
+fn an_open_refuses_only_without_an_existing_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    // Neither candidate exists: the open refuses, and the one stderr line names both
+    // directories it inspected — a refusal that hid the live one would read as if no
+    // directory was ever tried.
+    let missing = dir.path().join("missing");
+    let gone = dir.path().join("gone");
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p1",
+        "focused_pane_cwd": missing,
+    })
+    .to_string();
+    pane_with_cwd(dir.path(), "w1:p1", &gone);
+
+    let output = run_with_context("open", dir.path(), &herdr, &context);
+
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not a git repo"), "{stderr}");
-    assert!(
-        stderr.contains(dir.path().to_str().unwrap()),
-        "the refusal must name the rejected live cwd: {stderr}"
-    );
+    assert!(stderr.contains("no directory to open"), "{stderr}");
+    assert!(stderr.contains(missing.to_str().unwrap()), "names the context cwd: {stderr}");
+    assert!(stderr.contains(gone.to_str().unwrap()), "names the live cwd: {stderr}");
+
+    // No cwd at all refuses the same way.
+    let context = serde_json::json!({}).to_string();
+    let _ = fs::remove_file(dir.path().join("panes.json"));
+    let output = run_with_context("open", dir.path(), &herdr, &context);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<no cwd>"));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("plugin pane open"), "a refused open opens nothing: {calls}");
 }
 
 #[test]
