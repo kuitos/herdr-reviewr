@@ -134,9 +134,50 @@ pub struct Comment {
     pub diff_anchored: bool,
     /// Where the new side was read.
     pub rev: Rev,
+    /// The exact text the comment was made on, when it started from a character-level text
+    /// selection rather than whole lines.
+    pub quote: Option<Quote>,
 }
 
+/// A comment's quoted span: the exact source text of a character-level selection, and where it
+/// starts and ends on the comment's first and last anchored rows.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Quote {
+    /// The selected source text, rows joined by `\n` (folds contribute nothing).
+    pub text: String,
+    /// Char offset of the span's first character on the first anchored row.
+    pub start_col: usize,
+    /// Char offset just past the span's last character on the last anchored row.
+    pub end_col: usize,
+}
+
+impl Quote {
+    /// The quote as one line: every whitespace run, newlines included, collapses to one space,
+    /// and text past `max` chars is cut with `…`.
+    pub fn label(&self, max: usize) -> String {
+        let flat = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() <= max {
+            return flat;
+        }
+        let mut cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+/// The longest quote a heading carries, in chars.
+const QUOTE_LABEL_MAX: usize = 80;
+
 impl Comment {
+    /// The location, followed by the quoted span when the comment was made on one:
+    /// `path:3 · 「text」`.
+    pub fn heading(&self) -> String {
+        match &self.quote {
+            Some(q) => format!("{} · 「{}」", self.location(), q.label(QUOTE_LABEL_MAX)),
+            None => self.location(),
+        }
+    }
+
     /// The `path:start-end` (or `path:line`) location, with ` (removed)` when old-side.
     pub fn location(&self) -> String {
         let range = if self.start == self.end {
@@ -207,7 +248,7 @@ impl CommentStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{Comment, CommentStore, Rev, Scope, Side};
+    use super::{Comment, CommentStore, Quote, Rev, Scope, Side};
 
     fn comment(file: &str, start: u32, end: u32, text: &str) -> Comment {
         Comment {
@@ -219,6 +260,7 @@ mod tests {
             text: text.into(),
             diff_anchored: true,
             rev: Rev::Worktree,
+            quote: None,
         }
     }
 
@@ -250,6 +292,19 @@ mod tests {
         assert_eq!(c.location(), "a.rs:40");
         c.side = Side::Old;
         assert_eq!(c.location(), "a.rs:40 (removed)");
+    }
+
+    #[test]
+    fn heading_appends_the_quote_on_one_line_and_cuts_a_long_one() {
+        let mut c = comment("a.rs", 3, 4, "x");
+        assert_eq!(c.heading(), "a.rs:3-4", "no quote, the bare location");
+        c.quote = Some(Quote { text: "cache\n\t  layer ".into(), start_col: 2, end_col: 5 });
+        assert_eq!(c.heading(), "a.rs:3-4 · 「cache layer」", "whitespace runs collapse");
+        let long = Quote { text: "x".repeat(100), start_col: 0, end_col: 100 };
+        let label = long.label(80);
+        assert_eq!(label.chars().count(), 80);
+        assert!(label.ends_with('…'));
+        assert_eq!(Quote { text: "日本".into(), start_col: 0, end_col: 2 }.label(80), "日本");
     }
 
     #[test]

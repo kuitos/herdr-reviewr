@@ -3192,6 +3192,7 @@ fn changed_count_and_staleness_stay_scope_based_on_all_files() {
         text: "?".into(),
         diff_anchored: true,
         rev: herdr_reviewr::model::Rev::Worktree,
+        quote: None,
     };
     app.store.add(comment.clone());
 
@@ -6745,6 +6746,216 @@ fn a_triple_click_copies_the_whole_line_and_settles_its_highlight() {
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
     assert_eq!(app.status, "copied 10 chars");
     assert!(app.settled_selection().is_some(), "the repeat settles the line again");
+}
+
+/// Drag across `(row_a, col_a)..=(row_b, col_b)` of the read pane and release: the span
+/// copies and settles.
+fn sel_drag(app: &mut App, from: (usize, u16), to: (usize, u16)) {
+    let (ca, ra) = sel_cell(app, from.0, from.1);
+    let (cb, rb) = sel_cell(app, to.0, to.1);
+    sel_mouse(app, MouseEventKind::Down(MouseButton::Left), ca, ra);
+    sel_mouse(app, MouseEventKind::Drag(MouseButton::Left), cb, rb);
+    sel_mouse(app, MouseEventKind::Up(MouseButton::Left), cb, rb);
+}
+
+/// Save the open draft as `text` through the keys.
+fn submit_draft(app: &mut App, text: &str) {
+    typed(app, text);
+    press(app, &Keymap::default(), KeyCode::Enter);
+}
+
+#[test]
+fn comment_after_a_drag_quotes_the_span_and_anchors_to_its_line() {
+    use herdr_reviewr::model::Quote;
+    let r = selection_repo();
+    let mut app = app_on(&r);
+    // The drag leaves focus on the navigator the file opened from: `c` still takes the span.
+    assert_eq!(app.focus, Focus::Files);
+    sel_drag(&mut app, (0, 6), (0, 9));
+    assert_eq!(last_copy().as_deref(), Some("beta"));
+    assert_eq!(app.focus, Focus::Files, "a drag changes no focus");
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    assert!(app.composing(), "`c` opens the composer on the settled span");
+    assert_eq!(app.focus, Focus::Diff);
+    assert_eq!(app.selection_range(), (0, 0));
+    assert_eq!(app.pending_location().as_deref(), Some("m.rs:1 · 「beta」"));
+    submit_draft(&mut app, "why beta");
+
+    let c = app.store.get(0).expect("the comment saved");
+    assert_eq!((c.start, c.end, c.side), (1, 1, Side::New));
+    assert_eq!(c.quote, Some(Quote { text: "beta".into(), start_col: 6, end_col: 10 }));
+    assert_eq!(herdr_reviewr::export::format_all(&[c]), "m.rs:1 · 「beta」\n+alpha beta\nwhy beta");
+    assert_eq!(app.quoted_ranges().get(&0).map(Vec::as_slice), Some(&[(6, 10)][..]));
+
+    // The quoted characters are underlined on their line, and only those.
+    let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let underlined = |col: u16| {
+        let (x, y) = sel_cell(&app, 0, col);
+        buf.cell((x, y))
+            .unwrap()
+            .style()
+            .add_modifier
+            .contains(ratatui::style::Modifier::UNDERLINED)
+    };
+    assert!((6..10).all(underlined), "the span `beta` is underlined");
+    assert!(!underlined(5) && !underlined(0), "the rest of the line is not");
+    assert!(app.settled_selection().is_none(), "the keypress still cleared the highlight");
+}
+
+#[test]
+fn comment_after_a_double_click_quotes_the_word() {
+    use herdr_reviewr::model::Quote;
+    let r = selection_repo();
+    let mut app = app_on(&r);
+    let (c0, r0) = sel_cell(&app, 2, 5); // the `z` after the wide glyphs
+    for _ in 0..2 {
+        sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+        sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
+    }
+    assert_eq!(last_copy().as_deref(), Some("z"));
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    submit_draft(&mut app, "rename");
+    let c = app.store.get(0).unwrap();
+    assert_eq!((c.start, c.end), (3, 3));
+    assert_eq!(c.quote, Some(Quote { text: "z".into(), start_col: 3, end_col: 4 }));
+
+    // A triple settles the whole line, and `c` quotes all of it.
+    let (c1, r1) = sel_cell(&app, 0, 0);
+    for _ in 0..3 {
+        sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c1, r1);
+        sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c1, r1);
+    }
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    submit_draft(&mut app, "whole line");
+    let c = app.store.get(1).unwrap();
+    assert_eq!(c.quote, Some(Quote { text: "alpha beta".into(), start_col: 0, end_col: 10 }));
+}
+
+#[test]
+fn comment_after_a_multi_line_drag_anchors_the_rows_and_flattens_the_quote_on_export() {
+    use herdr_reviewr::model::Quote;
+    let r = selection_repo();
+    let mut app = app_on(&r);
+    sel_drag(&mut app, (0, 6), (2, 5));
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    assert_eq!(app.selection_range(), (0, 2), "the span's rows are the comment's range");
+    submit_draft(&mut app, "whole block");
+    let c = app.store.get(0).unwrap();
+    assert_eq!((c.start, c.end), (1, 3));
+    assert_eq!(
+        c.quote,
+        Some(Quote { text: "beta\n\tif x {\n日本 z".into(), start_col: 6, end_col: 4 })
+    );
+    assert_eq!(
+        herdr_reviewr::export::format_all(&[c]),
+        "m.rs:1-3 · 「beta if x { 日本 z」\n+alpha beta\n+\tif x {\n+日本 z\nwhole block"
+    );
+    let ranges = app.quoted_ranges();
+    assert_eq!(ranges[&0], vec![(6, u32::MAX)]);
+    assert_eq!(ranges[&1], vec![(0, u32::MAX)]);
+    assert_eq!(ranges[&2], vec![(0, 4)]);
+}
+
+#[test]
+fn comment_without_a_live_span_keeps_the_cursor_line() {
+    let r = selection_repo();
+    let mut app = app_on(&r);
+    let (c0, r0) = sel_cell(&app, 0, 0);
+    for _ in 0..2 {
+        sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+        sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), c0, r0);
+    }
+    assert!(app.settled_selection().is_some());
+    // `j` is something else: the span clears, and a later `c` comments the cursor line.
+    press(&mut app, &Keymap::default(), KeyCode::Char('j'));
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    assert!(app.composing());
+    assert_eq!(app.selection_range(), (1, 1));
+    assert_eq!(app.pending_location().as_deref(), Some("m.rs:2"), "no quote");
+    submit_draft(&mut app, "plain");
+    assert_eq!(app.store.get(0).unwrap().quote, None);
+}
+
+#[test]
+fn a_span_crossing_both_sides_keeps_its_quote_but_marks_whole_lines() {
+    let r = Repo::init();
+    r.write("a.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nBETA\n");
+    let mut app = app_on(&r);
+    // Rows: `alpha` (context), `-beta`, `+BETA`. Drag from the deletion into the insertion.
+    sel_drag(&mut app, (1, 1), (2, 2));
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    submit_draft(&mut app, "crossing");
+    let c = app.store.get(0).unwrap();
+    assert_eq!((c.side, c.start, c.end), (Side::New, 2, 2));
+    assert_eq!(c.quote.as_ref().map(|q| q.text.as_str()), Some("eta\nBET"));
+    assert_eq!(
+        herdr_reviewr::export::format_all(&[c]),
+        "a.rs:2 · 「eta BET」\n-beta\n+BETA\ncrossing"
+    );
+    assert!(app.quoted_ranges().is_empty(), "no column marking across sides");
+    assert!(app.commented_lines().contains(&2), "the whole-line marker still shows");
+}
+
+#[test]
+fn a_span_ending_on_a_fold_clamps_to_the_nearest_content_row() {
+    use herdr_reviewr::selection::{Point, Surface, TextDrag};
+    let r = Repo::init();
+    let body = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n") + "\n";
+    r.write("f.rs", &body);
+    r.commit_all("init");
+    r.write("f.rs", &body.replace("line 20\n", "line twenty\n"));
+    let mut app = app_on(&r);
+    let fold = app.visible.iter().position(|row| !row.is_content()).expect("a leading fold");
+    assert_eq!(fold, 0);
+    // A span from inside the fold to the second content row's third char.
+    let drag = TextDrag {
+        surface: Surface::Read,
+        anchor: Point { row: 0, chr: 4 },
+        extent: Point { row: 2, chr: 2 },
+    };
+    app.start_comment_with(Some(drag));
+    assert!(app.composing());
+    assert_eq!(app.selection_range(), (1, 2), "the fold end moves to the first content row");
+    submit_draft(&mut app, "folded start");
+    let q = app.store.get(0).unwrap().quote.clone().unwrap();
+    assert_eq!(q.start_col, 0);
+    assert_eq!(q.end_col, 3);
+    assert_eq!(q.text, format!("{}\nlin", app.visible[1].text()));
+
+    // A span on the fold alone anchors nothing new: the cursor line comments as ever.
+    let only_fold = TextDrag {
+        surface: Surface::Read,
+        anchor: Point { row: 0, chr: 0 },
+        extent: Point { row: 0, chr: 5 },
+    };
+    app.diff_cursor = 3;
+    app.start_comment_with(Some(only_fold));
+    assert_eq!(app.selection_range(), (3, 3));
+    assert!(app.pending_location().is_some_and(|l| !l.contains('「')));
+}
+
+#[test]
+fn comment_on_a_settled_preview_span_stays_read_only() {
+    let r = Repo::init();
+    r.write("doc.md", "# Title\n\nplain body words\n");
+    r.commit_all("init");
+    r.write("doc.md", "# Title\n\nplain body words changed\n");
+    let mut app = app_on(&r);
+    app.toggle_preview();
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    for _ in 0..2 {
+        sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y);
+        sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x, inner.y);
+    }
+    assert_eq!(last_copy().as_deref(), Some("Title"));
+    press(&mut app, &Keymap::default(), KeyCode::Char('c'));
+    assert!(!app.composing(), "the preview takes no comments, span or not");
+    assert!(app.store.is_empty());
 }
 
 #[test]

@@ -19,7 +19,7 @@ One persistent pane, pointed at a git worktree:
 - **Diff review** — the agent's changed files, syntax-highlighted.
 - **Four diff scopes** — uncommitted, branch, last turn, commits.
 - **Last-turn diff** — what the worktree's latest turn changed, on its own.
-- **Line comments** — comment on a line or a range. Then send it to the agent.
+- **Line comments** — comment on a line, a range, or the exact text you selected. Then send it to the agent.
 - **Text selection** — drag over any text to copy it, like an editor.
 - **File viewer** — any file's current content from the whole worktree.
 - **Search** — fuzzy file names and live code grep across the worktree, powered by [fff](https://github.com/dmtrKovalenko/fff).
@@ -133,7 +133,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | Key | Action |
 | --- | --- |
 | `v` | Select lines |
-| `c` | Comment on line or selection |
+| `c` | Comment on line, selection, or the text you just selected with the mouse |
 | `e` | Edit the comment under the cursor, or open the file in your editor |
 | `d` | Delete comment |
 | `n` `N` | Jump to next / previous comment |
@@ -163,7 +163,9 @@ jumps, and `Ctrl+W` / `Ctrl+U` / `Ctrl+K` deletes.
 | `r` | Refresh |
 
 The mouse works too. Drag over any text to select and copy it, double-click a word,
-triple-click a line. Click or drag the line-number gutter to comment. Click files, tabs, and
+triple-click a line. Press `c` right after selecting code to comment on exactly that text: the
+comment quotes it, underlines it, and sends it as `path:12 · 「quoted text」`. Click or drag the
+line-number gutter to comment. Click files, tabs, and
 links, and scroll with the wheel.
 
 ## The three tabs

@@ -1784,7 +1784,7 @@ fn elide_head(name: &str, max: usize) -> String {
 }
 
 /// A saved comment as inline display lines: a quiet box titled with the comment's location
-/// (in the comment-yellow accent) holding its wrapped text. Spliced read-only under the
+/// and quoted span (in the comment-yellow accent) holding its wrapped text. Spliced read-only under the
 /// commented line so a submitted comment stays visible while reviewing.
 fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'static>> {
     const INDENT: usize = CARD_INDENT;
@@ -1795,7 +1795,7 @@ fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'stati
     let body_style = Style::default().fg(p.text);
     let pad = || Span::raw(" ".repeat(INDENT));
 
-    let label = truncate_width(&format!(" comment · {} ", c.location()), box_w.saturating_sub(3));
+    let label = truncate_width(&format!(" comment · {} ", c.heading()), box_w.saturating_sub(3));
     let fill = box_w.saturating_sub(3 + label.width());
     let mut lines = vec![Line::from(vec![
         pad(),
@@ -1934,6 +1934,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         expand_hint: &expand_hint,
     };
     let commented = app.commented_lines();
+    let quoted = app.quoted_ranges();
     let (lo, hi) = app.selection_range();
     let selecting = app.focus == Focus::Diff && app.select_anchor.is_some();
 
@@ -1967,6 +1968,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
                 if row_cache.as_ref().is_none_or(|(r, _)| *r != row) {
                     let state = RowState {
                         commented: commented.contains(&row),
+                        quoted: quoted.get(&row).map_or(&[], Vec::as_slice),
                         cursor: row == app.diff_cursor,
                         selected: selecting && row >= lo && row <= hi,
                         hovered: hovered_row == Some(row),
@@ -2078,8 +2080,11 @@ struct RowLayout<'a> {
 /// A row's per-row highlight state.
 #[derive(Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)]
-struct RowState {
+struct RowState<'a> {
     commented: bool,
+    /// The char ranges `[a, b)` a comment quotes on this row, underlined
+    /// (`App::quoted_ranges`).
+    quoted: &'a [(u32, u32)],
     cursor: bool,
     selected: bool,
     /// Whether the pointer hovers this row — its change bar cell shows the gutter `+`
@@ -2091,9 +2096,9 @@ struct RowState {
 /// number, then syntax-colored code tinted red/green. With wrap on, a long line breaks
 /// into `code_width`-wide rows; a continuation row carries a blank gutter so numbers
 /// stay aligned. With wrap off, the line is one row scrolled by `h_scroll`.
-fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'static>> {
+fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState<'_>) -> Vec<Line<'static>> {
     let RowLayout { gutter_w, width, h_scroll, wrap, focused, pal, find, expand_hint } = layout;
-    let RowState { commented, cursor, selected, hovered } = state;
+    let RowState { commented, quoted, cursor, selected, hovered } = state;
     if let Row::Fold { .. } = row {
         let label = if cursor {
             format!("  ⋯  {} unmodified lines — {expand_hint} expand", row.hidden())
@@ -2146,6 +2151,13 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
     let hl_ranges =
         find.map(|(q, cs)| crate::app::find_match_ranges(&row.text(), q, cs)).unwrap_or_default();
     let mut cells = code_cells(row, emph_on, &hl_ranges);
+    // A quoted span underlines its own characters, over whatever fill the cell takes.
+    if !quoted.is_empty() {
+        for cell in &mut cells {
+            let i = cell.src as u32;
+            cell.quoted = quoted.iter().any(|&(a, b)| i >= a && i < b);
+        }
+    }
     // A dim syntax color — a code comment above all — loses legibility on the emphasis fill,
     // which `readable_tint` floors against `text` only. Lift the changed words' fg back to
     // their own plain-background legibility (`theme::legible`). Find matches already reverse to
@@ -2246,6 +2258,7 @@ fn plain_cell(ch: char) -> Cell {
         fg: Color::Reset,
         emph: false,
         hl: false,
+        quoted: false,
         src: 0,
     }
 }
@@ -2320,6 +2333,8 @@ struct Cell {
     fg: Color,
     emph: bool,
     hl: bool,
+    /// Whether the cell falls in a comment's quoted span, underlined.
+    quoted: bool,
     /// The source-char index this cell paints — a tab's expansion cells share one index —
     /// so the selection mapping reads the same expansion the painter used
     src: usize,
@@ -2344,12 +2359,12 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)]) -> Vec<Cell> {
             let src = idx as usize;
             if ch == '\t' {
                 for _ in 0..(TAB - col % TAB) {
-                    cells.push(Cell { ch: ' ', w: 1, fg, emph, hl, src });
+                    cells.push(Cell { ch: ' ', w: 1, fg, emph, hl, quoted: false, src });
                     col += 1;
                 }
             } else {
                 let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-                cells.push(Cell { ch, w, fg, emph, hl, src });
+                cells.push(Cell { ch, w, fg, emph, hl, quoted: false, src });
                 col += w;
             }
             idx += 1;
@@ -2358,24 +2373,29 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)]) -> Vec<Cell> {
     cells
 }
 
-/// Build spans from display cells, merging runs of equal color, emphasis, and find-highlight; a
-/// highlighted run takes `hl_bg` (the find match), else an emphasized run takes `emph_bg`.
+/// Build spans from display cells, merging runs of equal color, emphasis, find-highlight, and
+/// quote; a highlighted run takes `hl_bg` (the find match), else an emphasized run takes
+/// `emph_bg`, and a quoted run is underlined on top of either.
 fn cells_to_spans(cells: &[Cell], emph_bg: Color, hl: HlStyle) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut buf = String::new();
-    let mut cur: Option<(Color, bool, bool)> = None;
+    let mut cur: Option<(Color, bool, bool, bool)> = None;
+    let span = |text: String, (fg, emph, is_hl, quoted): (Color, bool, bool, bool)| {
+        let s = cell_span(text, fg, emph, is_hl, emph_bg, hl);
+        if quoted { s.patch_style(Style::default().add_modifier(Modifier::UNDERLINED)) } else { s }
+    };
     for c in cells {
-        let key = (c.fg, c.emph, c.hl);
+        let key = (c.fg, c.emph, c.hl, c.quoted);
         if cur != Some(key) {
-            if let Some((fg, emph, is_hl)) = cur {
-                spans.push(cell_span(std::mem::take(&mut buf), fg, emph, is_hl, emph_bg, hl));
+            if let Some(k) = cur {
+                spans.push(span(std::mem::take(&mut buf), k));
             }
             cur = Some(key);
         }
         buf.push(c.ch);
     }
-    if let Some((fg, emph, is_hl)) = cur {
-        spans.push(cell_span(buf, fg, emph, is_hl, emph_bg, hl));
+    if let Some(k) = cur {
+        spans.push(span(buf, k));
     }
     spans
 }
@@ -2986,7 +3006,7 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, c)| {
             let loc = Span::styled(
-                format!(" {}", c.location()),
+                format!(" {}", c.heading()),
                 Style::default().fg(p.purple).add_modifier(Modifier::BOLD),
             );
             let mut spans = vec![loc, Span::styled(format!("  {}", c.text), text_style(p))];
@@ -4512,6 +4532,7 @@ fn push_finding_quote(
         for row in &rows {
             let state = RowState {
                 commented: snippet_row_is_comment(row, start, end, side),
+                quoted: &[],
                 cursor: false,
                 selected: false,
                 hovered: false,

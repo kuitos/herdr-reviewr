@@ -14,6 +14,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   listing stops at 20,000 entries and says so. `git init` there turns **Changes** on without
   reopening the pane. The herdr actions now open on any existing directory, still preferring
   a git repo when the live and launch directories differ.
+- **Comment on the exact text you selected.** Drag over code in the diff or file view (or
+  double-click a word, triple-click a line), then press `c`: the comment anchors to those lines
+  and quotes the selected text. The comment box, the card, and the comments list show the
+  quote, the quoted characters stay underlined, and the export reads
+  `path:12 · 「quoted text」` above the snippet. A selection across removed and added lines
+  keeps its quote and marks whole lines. The markdown preview stays read-only.
+  ([#109](https://github.com/persiyanov/herdr-reviewr/issues/109))
 
 ## [0.39.0] — 2026-09-23
 

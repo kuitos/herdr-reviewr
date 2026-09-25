@@ -19,7 +19,7 @@ use crate::git;
 use crate::herdr::{self, AgentChoice, SendTarget};
 use crate::highlight::Highlighter;
 use crate::logln;
-use crate::model::{Comment, CommentStore, CommitPick, Rev, Scope, Side};
+use crate::model::{Comment, CommentStore, CommitPick, Quote, Rev, Scope, Side};
 use crate::theme::{self, Palette};
 use crate::world::{PickStatus, PickVerdict, RepoKind};
 
@@ -689,6 +689,9 @@ pub struct App {
     /// Whether the current compose was opened from the comments-list overlay, so finishing it
     /// returns there rather than dropping to the diff.
     resume_list: bool,
+    /// The quoted span a new comment is being written on: set when `comment` opens the
+    /// composer over a settled text selection, dropped when the composer closes.
+    draft_quote: Option<Quote>,
     /// Directory paths toggled away from the tab's resting state — collapsed in `Changes`
     /// (expanded by default), expanded in `All files` (collapsed by default). Keyed by path,
     /// so it survives a poll that rebuilds the tree.
@@ -945,6 +948,7 @@ impl App {
             reveal_diff: false,
             armed_cross: None,
             resume_list: false,
+            draft_quote: None,
             toggled_dirs: HashSet::new(),
             stash: TabStash::default(),
             changed: HashMap::new(),
@@ -1173,6 +1177,7 @@ impl App {
                 self.h_scroll = old.h_scroll;
                 self.select_anchor = old.select_anchor;
                 self.resume_list = old.resume_list;
+                self.draft_quote = old.draft_quote.take();
                 self.toggled_dirs = std::mem::take(&mut old.toggled_dirs);
                 self.stash = std::mem::take(&mut old.stash);
                 self.wrap = old.wrap;
@@ -3330,8 +3335,66 @@ impl App {
             self.input.clear();
             self.caret = 0;
             self.resume_list = false; // a fresh diff comment returns to the diff, not the list
+            self.draft_quote = None;
             self.mode = Mode::Composing { editing: None };
         }
+    }
+
+    /// `comment` with the settled selection the keypress found: a span of the read pane's
+    /// source text anchors the comment to its rows and quotes it exactly. Any other surface
+    /// (a card, the navigator, a painted preview) and no span at all comment as
+    /// [`Self::start_comment`] does.
+    pub fn start_comment_with(&mut self, settled: Option<crate::selection::TextDrag>) {
+        let Some((lo, hi)) = settled.and_then(|d| self.quotable_span(d)) else {
+            self.start_comment();
+            return;
+        };
+        let text = crate::selection::read_text(&self.visible, lo, hi);
+        // A span of nothing but whitespace names nothing worth quoting.
+        if text.trim().is_empty() {
+            self.start_comment();
+            return;
+        }
+        let first_len = self.visible[lo.row].text().chars().count();
+        let last_len = self.visible[hi.row].text().chars().count();
+        let quote = Quote {
+            text,
+            start_col: lo.chr.min(first_len),
+            end_col: hi.chr.saturating_add(1).min(last_len),
+        };
+        // A drag leaves focus where it was, often on the navigator the file was opened from:
+        // the span is on the read pane, so the comment is too.
+        self.focus = Focus::Diff;
+        self.select_anchor = (lo.row != hi.row).then_some(lo.row);
+        self.diff_cursor = hi.row;
+        self.start_comment();
+        if self.composing() {
+            self.draft_quote = Some(quote);
+        }
+    }
+
+    /// The settled span `d` as endpoints on content rows of the open view, or `None` where it
+    /// cannot anchor a comment: another surface, the read-only preview, or only fold rows.
+    /// An end on a fold moves inward to the nearest content row, taken whole from there.
+    fn quotable_span(
+        &self,
+        d: crate::selection::TextDrag,
+    ) -> Option<(crate::selection::Point, crate::selection::Point)> {
+        use crate::selection::{Point, Surface};
+        if d.surface != Surface::Read || self.preview_active() || !self.tab.is_file_tab() {
+            return None;
+        }
+        let (mut lo, mut hi) = d.ordered();
+        hi.row = hi.row.min(self.visible.len().checked_sub(1)?);
+        if !self.visible.get(lo.row)?.is_content() {
+            let row = (lo.row..=hi.row).find(|&i| self.visible[i].is_content())?;
+            lo = Point { row, chr: 0 };
+        }
+        if !self.visible[hi.row].is_content() {
+            let row = (lo.row..=hi.row).rev().find(|&i| self.visible[i].is_content())?;
+            hi = Point { row, chr: usize::MAX };
+        }
+        Some((lo, hi))
     }
 
     /// `edit`: the comment under the cursor, else the file the cursor names
@@ -3705,6 +3768,7 @@ impl App {
     fn leave_compose(&mut self) {
         self.input.clear();
         self.caret = 0;
+        self.draft_quote = None;
         let resume = std::mem::take(&mut self.resume_list);
         if resume && !self.store.is_empty() {
             self.list_cursor = self.list_cursor.min(self.store.len() - 1);
@@ -3764,18 +3828,20 @@ impl App {
         let diff_anchored = self.diff.view == View::Diff;
         // A content comment reads the worktree whatever the scope.
         let rev = if diff_anchored { self.current_rev() } else { Rev::Worktree };
-        Some(Comment { file, side, start, end, lines, text, diff_anchored, rev })
+        let quote = self.draft_quote.clone();
+        Some(Comment { file, side, start, end, lines, text, diff_anchored, rev, quote })
     }
 
     /// The `path:line` the composer is anchored to (selection for a new comment,
-    /// the existing location when editing). `None` when not composing.
+    /// the existing location when editing), followed by the quoted span when there is one.
+    /// `None` when not composing.
     pub fn pending_location(&self) -> Option<String> {
         match self.mode {
-            Mode::Composing { editing: Some(i) } => self.store.get(i).map(Comment::location),
+            Mode::Composing { editing: Some(i) } => self.store.get(i).map(Comment::heading),
             Mode::Composing { editing: None } => {
                 let file = self.diff_path.clone()?;
                 let (side, start, end, _) = self.selection_anchor()?;
-                // Only `location()` is read here, which ignores `diff_anchored`.
+                // Only `heading()` is read here, which ignores `diff_anchored`.
                 let c = Comment {
                     file,
                     side,
@@ -3785,8 +3851,9 @@ impl App {
                     text: String::new(),
                     diff_anchored: true,
                     rev: Rev::Worktree,
+                    quote: self.draft_quote.clone(),
                 };
-                Some(c.location())
+                Some(c.heading())
             }
             Mode::Normal
             | Mode::List
@@ -3838,6 +3905,34 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The quoted spans on the open view's rows: visible row → char ranges `[a, b)` of the
+    /// source text a comment quotes (`b` is `u32::MAX` where the span runs past the row's
+    /// end). A quote marks its columns only when its rows are
+    /// exactly the comment's rows on its side, one visible row per quoted line; a span that
+    /// crossed the other side, a fold, or rows since folded away keeps the text but marks
+    /// nothing here — its lines carry the whole-line comment marker alone.
+    pub fn quoted_ranges(&self) -> HashMap<usize, Vec<(u32, u32)>> {
+        let mut out: HashMap<usize, Vec<(u32, u32)>> = HashMap::new();
+        let Some(file) = self.diff_path.as_deref() else { return out };
+        for c in self.store.iter().filter(|c| c.file == file && self.comment_in_view(c)) {
+            let Some(q) = &c.quote else { continue };
+            let rows: Vec<usize> =
+                (0..self.visible.len()).filter(|&i| line_in(c, &self.visible[i])).collect();
+            let span = (c.end - c.start) as usize + 1;
+            let contiguous = rows.windows(2).all(|w| w[1] == w[0] + 1);
+            if rows.len() != span || !contiguous || c.lines.split('\n').count() != span {
+                continue;
+            }
+            let last = rows.len() - 1;
+            for (k, &row) in rows.iter().enumerate() {
+                let a = if k == 0 { q.start_col } else { 0 };
+                let b = if k == last { q.end_col } else { usize::MAX };
+                out.entry(row).or_default().push((a as u32, b.min(u32::MAX as usize) as u32));
+            }
+        }
+        out
     }
 
     /// The comment-card anchors as (row, store index) pairs, store-ordered. A comment's card
@@ -5329,11 +5424,14 @@ mod tests {
             text: "saved".to_string(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            quote: None,
         });
         old.mode = Mode::Composing { editing: None };
         old.resume_list = true;
         old.input = "draft".to_string();
         old.caret = 3;
+        let quote = crate::model::Quote { text: "span".into(), start_col: 1, end_col: 5 };
+        old.draft_quote = Some(quote.clone());
 
         let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
         recovered.carry_authored_state_from(&mut old);
@@ -5342,6 +5440,7 @@ mod tests {
         assert_eq!(recovered.input, "draft");
         assert_eq!(recovered.caret, 3);
         assert!(recovered.resume_list);
+        assert_eq!(recovered.draft_quote, Some(quote), "the draft keeps the span it quotes");
         assert!(matches!(recovered.mode, Mode::Composing { editing: None }));
     }
 
@@ -5602,6 +5701,7 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            quote: None,
         });
         app.diff_cursor = 2;
         app.start_edit();
@@ -5637,6 +5737,7 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            quote: None,
         });
         app.diff_cursor = 0;
         app.preview_text = "# heading".into();
@@ -5663,6 +5764,7 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            quote: None,
         });
         app.diff_cursor = 2;
         app.toggle_select();
@@ -5694,6 +5796,7 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            quote: None,
         });
         app.diff_cursor = 2;
         app.tab = super::Tab::Pr;
@@ -5715,6 +5818,7 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            quote: None,
         });
         app.diff_cursor = 0;
         app.focus = crate::Focus::Files;

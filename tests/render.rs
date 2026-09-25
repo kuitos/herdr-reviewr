@@ -406,6 +406,35 @@ fn a_saved_comment_renders_inline_as_a_card() {
 }
 
 #[test]
+fn a_quoted_comment_names_its_span_in_the_composer_card_and_list() {
+    use herdr_reviewr::selection::{Point, Surface, TextDrag};
+    let r = Repo::init();
+    r.write("a.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nlet cache = layer();\n");
+    let mut app = app_on(&r);
+    let row = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    let span = |a, b| TextDrag {
+        surface: Surface::Read,
+        anchor: Point { row, chr: a },
+        extent: Point { row, chr: b },
+    };
+    // Wide glyphs paint as one cell plus a blank, so compare with the blanks dropped.
+    let flat = |out: String| out.replace(' ', "");
+
+    app.start_comment_with(Some(span(4, 8)));
+    assert!(flat(render(&app)).contains("comment·a.rs:2·「cache」"), "the composer names the span");
+    for ch in "why a cache".chars() {
+        app.input_push(ch);
+    }
+    app.submit_comment();
+    assert!(flat(render(&app)).contains("╭─comment·a.rs:2·「cache」"), "so does the card");
+
+    app.open_list();
+    assert!(flat(render(&app)).contains("a.rs:2·「cache」whyacache"), "and the list row");
+}
+
+#[test]
 fn a_renamed_file_shows_old_arrow_new_in_the_header() {
     let r = Repo::init();
     r.write("old_name.rs", "stable contents that survive the move\nplus a second line\n");

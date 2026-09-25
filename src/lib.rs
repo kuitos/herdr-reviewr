@@ -1660,13 +1660,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
     use KeyCode::{Char, Down, Enter, Esc, Left, PageDown, PageUp, Right, Tab, Up};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+    // The settled span, read before anything clears it: `comment` anchors to it, and every
+    // other key drops it below.
+    let settled = app.settled_selection();
+
     // A keypress cancels the gesture but keeps consuming its drag events until mouse-up.
     app.cancel_divider_drag();
     // A reflow input cancels a live text or gutter gesture: nothing copies, and the key
     // still performs its own action. The hover `+` stays — it
     // recomputes each frame from the pointer's last reported cell.
     app.cancel_gesture();
-    // Any keypress is the user doing something else: the settled highlight clears
+    // Any keypress is the user doing something else: the settled highlight clears. The
+    // `comment` key is the one reader of what it spanned (`settled`, above).
     app.clear_settled_selection();
 
     if app.composing() {
@@ -1915,7 +1920,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::BasePick => app.open_base_picker(),
             K::CommitPick => app.open_commit_picker(),
             K::Select => app.toggle_select(),
-            K::Comment => app.start_comment(),
+            // A settled text selection on the read pane anchors the comment to its span.
+            K::Comment => app.start_comment_with(settled),
             // `edit`/`delete` act on the comment under the diff cursor, so they only fire with
             // the diff focused — otherwise `delete` would silently drop a comment under an
             // off-screen cursor. (The comments-list overlay targets the highlighted row instead.)

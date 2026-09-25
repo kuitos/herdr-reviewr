@@ -1,7 +1,7 @@
 //! Formatting comments and exporting them to the agent or clipboard.
 //!
-//! A comment becomes a block of `location`, the
-//! diff snippet, then the text. Export is consume-on-success: the caller removes
+//! A comment becomes a block of `location` (with its quoted span, when it
+//! has one), the diff snippet, then the text. Export is consume-on-success: the caller removes
 //! a comment only after `export` returns `Ok`.
 
 use std::io::Write;
@@ -12,9 +12,10 @@ use anyhow::{Context, Result, bail};
 use crate::herdr;
 use crate::model::Comment;
 
-/// One comment as its export block: location, snippet, then text.
+/// One comment as its export block: location (and quote), snippet, then text. The quote is
+/// flattened to one line, so it can never introduce the blank-line block separator.
 pub fn format_comment(comment: &Comment) -> String {
-    format!("{}\n{}\n{}", comment.location(), comment.lines, normalize_text(&comment.text))
+    format!("{}\n{}\n{}", comment.heading(), comment.lines, normalize_text(&comment.text))
 }
 
 /// Comment text for export: drop `\r`, trim trailing space per line, and drop blank
@@ -191,7 +192,13 @@ mod tests {
             text: text.into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            quote: None,
         }
+    }
+
+    fn quoted(c: Comment, text: &str) -> Comment {
+        let quote = crate::model::Quote { text: text.into(), start_col: 0, end_col: 1 };
+        Comment { quote: Some(quote), ..c }
     }
 
     #[test]
@@ -208,6 +215,18 @@ mod tests {
             format_comment(&c),
             "extruct/core/llm_registry.py:40-41\n-from .z import w\n+from .x import y\nthis import path looks wrong"
         );
+    }
+
+    #[test]
+    fn a_quoted_comment_names_its_span_after_the_location() {
+        let c = quoted(comment("plan.md", Side::New, 3, 3, " 缓存层设计", "why here?"), "缓存层");
+        assert_eq!(format_comment(&c), "plan.md:3 · 「缓存层」\n 缓存层设计\nwhy here?");
+        // A multi-line span flattens to one line, blank lines included, and a long one is cut.
+        let c = quoted(comment("a.rs", Side::New, 1, 3, "+a\n+\n+b", "t"), "alpha(\n\n    beta)");
+        assert_eq!(format_comment(&c), "a.rs:1-3 · 「alpha( beta)」\n+a\n+\n+b\nt");
+        let c = quoted(comment("a.rs", Side::Old, 9, 9, "-x", "t"), &"y".repeat(90));
+        let head = format_comment(&c).lines().next().unwrap().to_string();
+        assert_eq!(head, format!("a.rs:9 (removed) · 「{}…」", "y".repeat(79)));
     }
 
     #[test]
