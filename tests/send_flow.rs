@@ -430,4 +430,18 @@ fn immediate_delivery_quotes_each_saved_comment_into_the_agent_input() {
     assert_eq!(app.status, "no agent here — comment kept");
     assert_eq!(app.store.len(), 2);
     assert!(!log(&fake_dir).contains("agent focus"), "immediate delivery never focuses");
+
+    // `s` then sends what was kept in the same quote shape, framed by newlines, and still
+    // leaves focus on the review.
+    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+    let framed = count(&fake_dir, "pane send-keys w8:p2 ctrl+j");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert_eq!(app.mode, Mode::Picker, "several agents: the picker arms the last-used row");
+    press(&mut app, KeyCode::Enter, area, &keymap);
+    assert!(app.store.is_empty(), "status: {}", app.status);
+    assert_eq!(count(&fake_dir, "pane send-keys w8:p2 ctrl+j"), framed + 2);
+    let sent = log(&fake_dir);
+    assert!(sent.contains("\u{1b}[200~> "), "the kept comments go out as quotes: {sent}");
+    assert!(sent.contains("kept, edited") && sent.contains("nowhere\u{1b}[201~"), "log: {sent}");
+    assert!(!sent.contains("agent focus"), "a send in immediate mode never focuses");
 }

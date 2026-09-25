@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use crate::config::Deliver;
 use crate::diff::{DiffCache, FileDiff, Row, View};
-use crate::export::{Agent, ExportTarget, format_all, format_quote};
+use crate::export::{Agent, ExportTarget, format_quote};
 use crate::file_list::{self, Annotation, Entry, RowKind};
 use crate::forge;
 use crate::git;
@@ -5119,7 +5119,8 @@ impl App {
             logln!("export -> {} refused: {not_ready:?}", agent.pane_id);
             return;
         }
-        let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
+        let quote = self.plugin_config().is_some_and(|c| c.deliver() == Deliver::Immediate);
+        let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone(), quote };
         if self.export(&target) {
             self.last_sent_pane = Some(agent.pane_id.clone());
         }
@@ -5134,7 +5135,7 @@ impl App {
             return false;
         }
         let refs: Vec<&Comment> = self.store.iter().collect();
-        let text = format_all(&refs);
+        let text = target.format(&refs);
         let n = refs.len();
         logln!("export ({n}) -> {} ::\n{text}", target.label());
         let delivered = match target.export(&text) {

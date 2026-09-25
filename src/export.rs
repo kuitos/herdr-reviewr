@@ -48,14 +48,29 @@ fn normalize_text(text: &str) -> String {
 
 /// Many comments, sorted by file then start line, one blank line between blocks.
 pub fn format_all(comments: &[&Comment]) -> String {
+    sorted(comments).iter().map(|c| format_comment(c)).collect::<Vec<_>>().join("\n\n")
+}
+
+/// Many comments as consecutive quotes, sorted like `format_all`: what `send` delivers under
+/// `deliver = "immediate"`, so the comments left over from a refused delivery land in the same
+/// shape as the ones that went out on save.
+pub fn format_all_quotes(comments: &[&Comment]) -> String {
+    sorted(comments).iter().map(|c| format_quote(c)).collect::<Vec<_>>().join("\n")
+}
+
+fn sorted<'a>(comments: &[&'a Comment]) -> Vec<&'a Comment> {
     let mut sorted = comments.to_vec();
     sorted.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
-    sorted.iter().map(|c| format_comment(c)).collect::<Vec<_>>().join("\n\n")
+    sorted
 }
 
 /// A destination comments can be exported to. Export succeeds or errors as a whole.
 pub trait ExportTarget {
     fn export(&self, text: &str) -> Result<()>;
+    /// The text this destination receives for `comments`.
+    fn format(&self, comments: &[&Comment]) -> String {
+        format_all(comments)
+    }
     fn label(&self) -> &'static str;
     /// Destination-specific confirmation shown after a successful export.
     fn success_message(&self, count: usize) -> String;
@@ -136,6 +151,9 @@ fn select_tool(
 pub struct Agent {
     pub pane: String,
     pub name: String,
+    /// `deliver = "immediate"`: the set goes in as quotes framed by newlines, like each
+    /// immediate delivery, and focus stays on the review.
+    pub quote: bool,
 }
 
 impl ExportTarget for Agent {
@@ -156,7 +174,14 @@ impl ExportTarget for Agent {
         "agent not found".to_string()
     }
 
+    fn format(&self, comments: &[&Comment]) -> String {
+        if self.quote { format_all_quotes(comments) } else { format_all(comments) }
+    }
+
     fn export(&self, text: &str) -> Result<()> {
+        if self.quote {
+            return herdr::deliver_quote(&self.pane, text);
+        }
         herdr::send_text(&self.pane, text)?;
         // Focus is a convenience once the text is delivered; a focus failure must NOT fail the
         // export, or the comments stay unconsumed and the next Send duplicates the whole review.
@@ -193,7 +218,7 @@ mod tests {
     fn export_confirmations_name_the_actual_result_and_pluralize_comments() {
         // The agent line names the pane it addressed, so a mis-send is visible the moment it
         // lands.
-        let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
+        let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into(), quote: false };
         assert_eq!(agent.success_message(1), "added 1 comment to release-bot");
         assert_eq!(agent.success_message(2), "added 2 comments to release-bot");
         assert_eq!(Clipboard.success_message(1), "copied 1 comment");
@@ -217,6 +242,16 @@ mod tests {
     fn quoted(c: Comment, text: &str) -> Comment {
         let quote = crate::model::Quote { text: text.into(), start_col: 0, end_col: 1 };
         Comment { quote: Some(quote), ..c }
+    }
+
+    #[test]
+    fn quotes_join_sorted_one_after_another() {
+        let late = comment("b.rs", Side::New, 9, 9, "+y", "second");
+        let early = comment("a.rs", Side::New, 1, 1, "+x", "first");
+        assert_eq!(
+            super::format_all_quotes(&[&late, &early]),
+            "> a.rs:1\n> +x\nfirst\n> b.rs:9\n> +y\nsecond"
+        );
     }
 
     #[test]

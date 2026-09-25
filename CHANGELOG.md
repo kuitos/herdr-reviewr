@@ -25,7 +25,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   save it: `> path:12「quoted text」` (or the location and the quoted snippet lines), then your
   comment, between two newlines. It never presses Enter or moves focus, so you keep reviewing
   and submit when you are ready. With several agents, the one you sent to last takes it, and
-  the first delivery asks with the picker. A comment that can't be delivered stays for `s`.
+  the first delivery asks with the picker. A comment that can't be delivered stays for `s`. Under
+  immediate, `s` sends those leftovers in the same quote shape, framed by newlines, without
+  moving focus.
   The default, `batch`, is unchanged.
 - **The footer says `c comment span`** while a selection is settled on the diff or file view,
   so the quote-a-selection comment is discoverable.
