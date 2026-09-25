@@ -21,6 +21,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `path:12 · 「quoted text」` above the snippet. A selection across removed and added lines
   keeps its quote and marks whole lines. The markdown preview stays read-only.
   ([#109](https://github.com/persiyanov/herdr-reviewr/issues/109))
+- **`deliver = "immediate"` puts each comment straight into the agent's input box** as you
+  save it: `> path:12「quoted text」` (or the location and the quoted snippet lines), then your
+  comment, between two newlines. It never presses Enter or moves focus, so you keep reviewing
+  and submit when you are ready. With several agents, the one you sent to last takes it, and
+  the first delivery asks with the picker. A comment that can't be delivered stays for `s`.
+  The default, `batch`, is unchanged.
+- **The footer says `c comment span`** while a selection is settled on the diff or file view,
+  so the quote-a-selection comment is discoverable.
+
+### Fixed
+- **Sending waits for an agent that is busy with a dialog.** If herdr reports the agent
+  `blocked` on a confirmation, or its screen shows a dialog's `Enter … Esc` key hints (Codex's
+  model picker reports `idle`), reviewr writes nothing and keeps your comments instead of
+  typing them into the dialog. ([#86](https://github.com/persiyanov/herdr-reviewr/issues/86))
 
 ## [0.39.0] — 2026-09-23
 

@@ -18,6 +18,23 @@ pub fn format_comment(comment: &Comment) -> String {
     format!("{}\n{}\n{}", comment.heading(), comment.lines, normalize_text(&comment.text))
 }
 
+/// One comment as the quote an immediate delivery drops into the agent's input box, the shape
+/// a reply quote takes in a chat composer: the quoted span on one `> ` line after its location
+/// (`> path:3「text」`), or, for a comment on whole lines, the location and then each snippet
+/// line behind its own `> `, markers kept. The comment text follows on the next line, its
+/// line breaks kept.
+pub fn format_quote(comment: &Comment) -> String {
+    let quote = match comment.quote_label() {
+        Some(label) => format!("> {}「{label}」", comment.location()),
+        None => std::iter::once(comment.location())
+            .chain(comment.lines.lines().map(str::to_string))
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    format!("{quote}\n{}", normalize_text(&comment.text))
+}
+
 /// Comment text for export: drop `\r`, trim trailing space per line, and drop blank
 /// lines so a multi-line comment can never introduce the blank-line block separator.
 fn normalize_text(text: &str) -> String {
@@ -151,7 +168,8 @@ impl ExportTarget for Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, CLIPBOARD_TOOLS, Clipboard, ExportTarget, format_all, format_comment, select_tool,
+        Agent, CLIPBOARD_TOOLS, Clipboard, ExportTarget, format_all, format_comment, format_quote,
+        select_tool,
     };
     use crate::model::{Comment, Side};
 
@@ -227,6 +245,30 @@ mod tests {
         let c = quoted(comment("a.rs", Side::Old, 9, 9, "-x", "t"), &"y".repeat(90));
         let head = format_comment(&c).lines().next().unwrap().to_string();
         assert_eq!(head, format!("a.rs:9 (removed) · 「{}…」", "y".repeat(79)));
+    }
+
+    #[test]
+    fn a_quoted_comment_delivers_as_one_quote_line_then_its_text() {
+        let c = quoted(comment("plan.md", Side::New, 3, 3, " 缓存层设计", "why here?"), "缓存层");
+        assert_eq!(format_quote(&c), "> plan.md:3「缓存层」\nwhy here?");
+        // The quote flattens and cuts exactly like the heading, and the text keeps its breaks.
+        let c = quoted(comment("a.rs", Side::Old, 1, 3, "-a\n-b", "one\n\n two\n"), "a(\n\n  b)");
+        assert_eq!(format_quote(&c), "> a.rs:1-3 (removed)「a( b)」\none\n two");
+        let c = quoted(comment("a.rs", Side::New, 9, 9, "+x", "t"), &"y".repeat(90));
+        let head = format_quote(&c).lines().next().unwrap().to_string();
+        assert_eq!(head, format!("> a.rs:9「{}…」", "y".repeat(79)));
+    }
+
+    #[test]
+    fn a_line_comment_delivers_its_snippet_behind_quote_markers() {
+        let c = comment("a.rs", Side::New, 40, 41, "-from .z import w\n+from .x import y", "wrong");
+        assert_eq!(
+            format_quote(&c),
+            "> a.rs:40-41\n> -from .z import w\n> +from .x import y\nwrong"
+        );
+        // A context line keeps its space marker.
+        let c = comment("a.rs", Side::New, 7, 7, "     keep()", "why?");
+        assert_eq!(format_quote(&c), "> a.rs:7\n>      keep()\nwhy?");
     }
 
     #[test]

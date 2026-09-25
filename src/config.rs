@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 12] = [
+const PLUGIN_CONFIG_KEYS: [&str; 13] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -78,6 +78,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 12] = [
     "azure_devops_host",
     "editor",
     "url_opener",
+    "deliver",
     "keybindings",
 ];
 
@@ -139,6 +140,24 @@ impl TogglePlacement {
     }
 }
 
+/// When a saved comment reaches the agent: all at once on `send` (`batch`), or each one
+/// straight into the agent's input box the moment it is saved (`immediate`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Deliver {
+    #[default]
+    Batch,
+    Immediate,
+}
+
+impl Deliver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Immediate => "immediate",
+        }
+    }
+}
+
 /// Direction for split placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToggleDirection {
@@ -169,6 +188,7 @@ pub struct PluginConfig {
     azure_devops_host: Option<String>,
     editor: Option<String>,
     url_opener: Option<String>,
+    deliver: Deliver,
     keymap: crate::keymap::Keymap,
 }
 
@@ -186,6 +206,7 @@ impl Default for PluginConfig {
             azure_devops_host: None,
             editor: None,
             url_opener: None,
+            deliver: Deliver::Batch,
             keymap: crate::keymap::Keymap::default(),
         }
     }
@@ -248,6 +269,11 @@ impl PluginConfig {
         self.url_opener.as_deref()
     }
 
+    /// When a saved comment reaches the agent.
+    pub fn deliver(&self) -> Deliver {
+        self.deliver
+    }
+
     /// The resolved keymap: the defaults with this snapshot's `[keybindings]` applied.
     pub fn keymap(&self) -> &crate::keymap::Keymap {
         &self.keymap
@@ -276,6 +302,7 @@ impl PluginConfig {
             "azure_devops_host": self.azure_devops_host,
             "editor": self.editor,
             "url_opener": self.url_opener,
+            "deliver": self.deliver.as_str(),
             "keybindings": keybindings,
         })
     }
@@ -478,6 +505,13 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             return Err(value_error(path, "url_opener", "a command that names a program first"));
         }
         config.url_opener = Some(command.to_owned());
+    }
+    if let Some(value) = table.get("deliver") {
+        config.deliver = match string_value(path, "deliver", value, "one of batch, immediate")? {
+            "batch" => Deliver::Batch,
+            "immediate" => Deliver::Immediate,
+            _ => return Err(value_error(path, "deliver", "one of batch, immediate")),
+        };
     }
     // A hostname is recognized by at most one forge; a cross-key collision is an invalid
     // value under CFG-WHOLE-FILE. Scanned as a set so a new key joins by
@@ -683,7 +717,9 @@ pub fn print_plugin_config() -> Result<(), PluginConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, NavigatorPosition, PluginConfig, ToggleDirection, TogglePlacement};
+    use super::{
+        Config, Deliver, NavigatorPosition, PluginConfig, ToggleDirection, TogglePlacement,
+    };
     use crate::keymap::KeyCode;
     use crate::model::Scope;
     use std::time::Duration;
@@ -757,6 +793,7 @@ mod tests {
         assert!(config.auto_open());
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
+        assert_eq!(config.deliver(), Deliver::Batch);
     }
 
     #[test]
@@ -772,6 +809,7 @@ mod tests {
                 "toggle_direction = \"down\"\n",
                 "auto_open = false\n",
                 "github_host = \"GitHub.Example.COM\"\n",
+                "deliver = \"immediate\"\n",
             ),
         )
         .unwrap();
@@ -783,6 +821,7 @@ mod tests {
         assert_eq!(config.toggle_direction(), ToggleDirection::Down);
         assert!(!config.auto_open());
         assert_eq!(config.github_host(), Some("github.example.com"));
+        assert_eq!(config.deliver(), Deliver::Immediate);
     }
 
     #[test]
@@ -868,6 +907,8 @@ mod tests {
             ("url_opener = \"bridge {ur}\"\n", "`{ur}`"),
             ("url_opener = \"''\"\n", "`url_opener`"),
             ("url_opener = \"{url} --new\"\n", "`url_opener`"),
+            ("deliver = \"now\"\n", "`deliver`"),
+            ("deliver = true\n", "`deliver`"),
             ("github_host = \"github.com\"\n", "`github_host`"),
             ("github_host = \"gitlab.com\"\n", "`github_host`"),
             ("gitlab_host = \"gitlab.com\"\n", "`gitlab_host`"),
@@ -1142,6 +1183,7 @@ mod tests {
         assert_eq!(object["toggle_direction"], "right");
         assert_eq!(object["auto_open"], true);
         assert!(object["github_host"].is_null());
+        assert_eq!(object["deliver"], "batch");
         let keybindings = object["keybindings"].as_object().unwrap();
         assert_eq!(
             keybindings.len(),

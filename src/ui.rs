@@ -2605,6 +2605,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
     let hint = |action: K| app.keymap().hint(action).label();
     let (k, l): (String, &str) = match action {
         A::Comment => (hint(K::Comment), "comment"),
+        A::CommentSpan => (hint(K::Comment), "comment span"),
         // One word for one gesture: `v` marks a range end in the diff and the commit picker alike.
         A::Select | A::CommitAnchor => (hint(K::Select), "select"),
         A::ClearSelection => ("esc".into(), "clear"),
@@ -3119,7 +3120,10 @@ fn picker_trail(app: &App, row: &AgentChoice) -> String {
 }
 
 fn picker_title(app: &App) -> String {
-    let n = app.store.len();
+    let n = match app.picker_purpose {
+        crate::app::PickerPurpose::SendAll => app.store.len(),
+        crate::app::PickerPurpose::DeliverOne(_) => 1,
+    };
     let noun = if n == 1 { "comment" } else { "comments" };
     format!("send {n} {noun} to")
 }

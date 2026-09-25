@@ -1,6 +1,6 @@
-//! herdr host integration: resolve the agent pane to send to, sample the agents turn
-//! tracking watches, ask herdr for the plugin config directory, and stamp/clear the
-//! pane's cosmetic `reviewr` label.
+//! herdr host integration: resolve the agent pane to send to and check it can take text,
+//! sample the agents turn tracking watches, ask herdr for the plugin config directory, and
+//! stamp/clear the pane's cosmetic `reviewr` label.
 //!
 //! Uses the herdr CLI via `$HERDR_BIN_PATH`. The two agent readers
 //! ask different questions and neither narrows the other: [`send_target`] resolves candidates
@@ -235,11 +235,39 @@ fn agent_list() -> Result<Vec<AgentPane>> {
     parse_agents(&herdr(&["agent", "list"])?)
 }
 
+/// Why [`send_target`] found nowhere to send. Its `Display` is the batch send's whole status
+/// line; an immediate delivery says its own tail after [`NoTarget::cause`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoTarget {
+    /// The workspace holds no agent but our own pane.
+    NoAgent,
+    /// `agent list` failed, so there is no count to report.
+    NoAnswer,
+}
+
+impl NoTarget {
+    /// The refusal's cause alone, without the fallback it names.
+    pub fn cause(self) -> &'static str {
+        match self {
+            Self::NoAgent => "no agent here",
+            Self::NoAnswer => "herdr did not answer",
+        }
+    }
+}
+
+impl std::fmt::Display for NoTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} — copy to the clipboard instead", self.cause())
+    }
+}
+
+impl std::error::Error for NoTarget {}
+
 /// What `Send` does: one workspace agent sends directly, several open the picker, and no
 /// agent refuses. A failed enumeration refuses too, but says so rather
 /// than reporting a count herdr never gave. Either refusal is the whole status line, so both
 /// stay one short sentence naming the clipboard the reviewer can fall back to.
-pub fn send_target() -> Result<SendTarget> {
+pub fn send_target() -> Result<SendTarget, NoTarget> {
     let (ws, me) = agent_env();
     let agents = match agent_list() {
         Ok(agents) => agents,
@@ -247,7 +275,7 @@ pub fn send_target() -> Result<SendTarget> {
             // A refusal is the whole status line, so it says the clipboard rather than herdr's
             // own wording. The cause is already in the log, with the argv `herdr` kept out of it.
             logln!("agent list failed: {e:#}");
-            bail!("herdr did not answer — copy to the clipboard instead")
+            return Err(NoTarget::NoAnswer);
         }
     };
     // Candidacy is decided once, here: an `agent` field, our workspace, not our own pane.
@@ -255,7 +283,7 @@ pub fn send_target() -> Result<SendTarget> {
     // tracking does not come through here: it asks where each agent works instead.
     let picked = candidates(&agents, ws.as_deref(), me.as_deref());
     match picked.len() {
-        0 => bail!("no agent here — copy to the clipboard instead"),
+        0 => Err(NoTarget::NoAgent),
         // The sole-agent send shows no row, so only the picker pays for the tab-label call.
         1 => Ok(SendTarget::One(picked[0].choice(&HashMap::new()))),
         _ => {
@@ -432,6 +460,96 @@ fn pasted(text: &str) -> String {
     format!("{PASTE_START}{body}{PASTE_END}")
 }
 
+/// Why a chosen agent cannot take text right now. Every send checks this first and writes
+/// nothing when it holds (issue #86): typed into a confirmation or a picker, the text would
+/// answer the dialog instead of landing in the input box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotReady {
+    /// herdr reports the agent `blocked`: it is waiting on a permission or confirmation.
+    Blocked,
+    /// The pane's screen shows a dialog's key hints. Codex keeps reporting `working` or
+    /// `idle` under its model picker, so the screen is the only witness there.
+    Dialog,
+}
+
+impl NotReady {
+    /// The reason as a status line's head; the caller says what it kept.
+    pub fn cause(self) -> &'static str {
+        match self {
+            Self::Blocked => "agent is waiting for a confirmation",
+            Self::Dialog => "agent has a dialog open",
+        }
+    }
+}
+
+/// How many of the screen's last non-empty lines the dialog check reads: a dialog's key
+/// hints sit at its foot, which is the foot of the screen.
+const DIALOG_HINT_LINES: usize = 8;
+
+/// Whether `pane` can take text now: not `blocked`, and no dialog hint on its visible screen.
+/// `working` is ready — both agents take typing into the input box mid-turn. A check herdr
+/// cannot answer does not block: it logs, and the send goes ahead as it did before the check.
+pub fn target_ready(pane: &str) -> Result<(), NotReady> {
+    match herdr(&["agent", "get", pane]).and_then(|json| parse_agent_status(&json)) {
+        Ok(status) if Status::from_wire(&status) == Status::Blocked => {
+            return Err(NotReady::Blocked);
+        }
+        Ok(_) => {}
+        Err(e) => logln!("agent get {pane} unreadable, not blocking the send: {e:#}"),
+    }
+    match herdr(&["pane", "read", pane, "--source", "visible"]) {
+        Ok(screen) if shows_dialog_hint(&screen) => return Err(NotReady::Dialog),
+        Ok(_) => {}
+        Err(e) => logln!("pane read {pane} failed, not blocking the send: {e:#}"),
+    }
+    Ok(())
+}
+
+/// The `agent_status` of the one agent in an `agent get` envelope.
+fn parse_agent_status(json: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Response {
+        result: Get,
+    }
+    #[derive(Deserialize)]
+    struct Get {
+        agent: Entry,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        agent_status: String,
+    }
+    let response: Response = serde_json::from_str(json).context("parsing agent get")?;
+    Ok(response.result.agent.agent_status)
+}
+
+/// Whether one of the screen's last [`DIALOG_HINT_LINES`] non-empty lines carries a dialog's
+/// key hints: the whole words `enter` and `esc` on the same line, in either order
+/// (`Enter to confirm · Esc to cancel`, `enter select · esc back`). `esc` alone is the working
+/// spinner's `esc to interrupt`, and never counts.
+fn shows_dialog_hint(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().filter(|line| !line.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(DIALOG_HINT_LINES)..].iter().any(|line| {
+        let line = line.to_lowercase();
+        let words: Vec<&str> = line.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+        words.contains(&"enter") && words.contains(&"esc")
+    })
+}
+
+/// Drop one comment into the agent's input box on a line of its own: a newline, the text as a
+/// bracketed paste, and a newline after it so the reviewer keeps typing below. `ctrl+j` is a
+/// newline, never a submit, in the Claude Code and Codex input boxes, and nothing here presses
+/// Enter or moves focus. A failure before the text lands writes nothing a retry would repeat;
+/// once the text is in, a failed closing newline only logs, or a retry would paste it twice.
+pub fn deliver_quote(pane: &str, text: &str) -> Result<()> {
+    herdr(&["pane", "send-keys", pane, "ctrl+j"])?;
+    send_text(pane, text)?;
+    if let Err(e) = herdr(&["pane", "send-keys", pane, "ctrl+j"]) {
+        logln!("closing newline to {pane} failed after the text landed: {e:#}");
+    }
+    Ok(())
+}
+
 /// Focus the agent pane so the reviewer can add context and submit.
 pub fn focus(pane: &str) -> Result<()> {
     herdr(&["agent", "focus", pane])?;
@@ -603,6 +721,38 @@ mod tests {
         // And with `name` explicitly null, as `herdr agent rename --clear` leaves it.
         let cleared = r#"{"result":{"agents":[{"agent":"codex","agent_status":"idle","pane_id":"w8:p2","tab_id":"w8:t1","workspace_id":"w8","name":null}]}}"#;
         assert_eq!(parse_agents(cleared).unwrap()[0].row_name(), "codex");
+    }
+
+    #[test]
+    fn a_dialog_hint_needs_both_enter_and_esc_as_words_on_one_line() {
+        use super::shows_dialog_hint as hint;
+        assert!(hint("› prompt\n\n  Enter to confirm · Esc to cancel\n"));
+        assert!(hint("  1. gpt-5\n  2. o3\n  enter select · esc back"));
+        assert!(hint("ESC closes, ENTER picks"), "either order, any case");
+        // The working spinner's hint names `esc` alone.
+        assert!(!hint("✻ Working… (12s · esc to interrupt)\n> "));
+        // Whole words only, and both on the same line.
+        assert!(!hint("press Escape to cancel, Entered values stay"));
+        assert!(!hint("Enter to send\nesc to interrupt"));
+        assert!(!hint(""));
+    }
+
+    #[test]
+    fn a_dialog_hint_counts_only_among_the_last_non_empty_lines() {
+        let screen = |below: usize| {
+            let tail = vec!["output\n\n"; below].concat();
+            format!("Enter to confirm · Esc to cancel\n{tail}")
+        };
+        assert!(!super::shows_dialog_hint(&screen(8)), "scrolled past the foot");
+        assert!(super::shows_dialog_hint(&screen(7)), "blank lines do not count");
+    }
+
+    #[test]
+    fn agent_get_reads_the_status_of_its_one_agent() {
+        // The live 0.9.1 envelope, trimmed: `result.agent`, not `result.agents`.
+        let json = r#"{"id":"cli:agent:get","result":{"agent":{"agent":"claude","agent_status":"blocked","pane_id":"w6:p1"},"type":"agent_info"}}"#;
+        assert_eq!(super::parse_agent_status(json).unwrap(), "blocked");
+        assert!(super::parse_agent_status("").is_err());
     }
 
     #[test]

@@ -28,8 +28,10 @@ One persistent pane, pointed at a git worktree:
 - **Markdown preview** — flip a `.md` file between source and rendered view.
 - **Themes** — 18 palettes in dark and light.
 
-It never edits your worktree and sends nothing on its own. The **PR** tab reads GitHub,
-GitLab, or Azure DevOps and never posts.
+It never edits your worktree and sends nothing you did not write: by default nothing leaves
+until you press `s`, and with [`deliver = "immediate"`](#delivery) each comment goes to the
+agent's input box as you save it, never submitted. The **PR** tab reads GitHub, GitLab, or
+Azure DevOps and never posts.
 
 ## Requirements
 
@@ -226,6 +228,7 @@ toggle_direction = "down"
 auto_open = false
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
+deliver = "immediate"
 
 [keybindings]
 comment = ["c", "ㅊ"]
@@ -313,6 +316,29 @@ It reads like the `editor` key: quotes group words, and `{url}` goes where you p
 end. The URL always arrives as one argument, never through a shell. So don't use
 `ssh host open {url}`: ssh hands its arguments to the remote shell, where a crafted link could run
 commands.
+
+### Delivery
+
+By default (`deliver = "batch"`) comments wait in the pane until `s` sends them all at once.
+With `deliver = "immediate"`, each new comment goes into the agent's input box the moment you
+save it, as a quote you can keep typing under:
+
+```text
+> src/cache.rs:12「fn evict(&mut self)」
+why not LRU here?
+```
+
+A comment on selected text quotes that text on one line. A comment on whole lines quotes the
+location and each snippet line (`> +added`, `> -removed`) instead. The quote is pasted between
+two newlines (`ctrl+j`). reviewr never presses Enter and never moves focus, so you submit
+when you are done and your cursor stays on the review. One agent takes the comment directly.
+With several, the one you sent to last takes it, and the first delivery asks with the picker.
+Editing a saved comment sends nothing. If the comment can't be delivered it stays in the
+pane, and `s` sends it later.
+
+Every send, batch or immediate, first checks that the agent can take text. If herdr reports
+it `blocked` on a confirmation, or its screen shows a dialog's key hints (`Enter to confirm ·
+Esc to cancel`), reviewr writes nothing and keeps your comments. A working agent is fine.
 
 ### Keybindings
 
@@ -447,6 +473,8 @@ The known constraints:
 **herdr coupling**
 - **Send needs an agent in the workspace** — one agent takes the comments straight away, and
   several open a picker so you choose. With no agent, Send says so and keeps your comments.
+  An agent waiting on a confirmation or showing a dialog gets nothing until it is back at its
+  prompt.
 - **last turn relies on polling** (2 s default) — a turn that starts and finishes inside one
   poll is missed, and the scope shows everything since the last *observed* turn start, your
   own edits included.
@@ -475,7 +503,8 @@ The known constraints:
 - **Comments are in-memory and single-session** — closing the pane loses any you haven't sent
   or copied out.
 - **Sending is all-or-nothing** — Send (or copy) delivers the whole set and clears it. A
-  failure leaves everything in place.
+  failure leaves everything in place. With `deliver = "immediate"`, each comment goes on its own
+  as you save it and leaves the pane only once it lands.
 - **No line-number rebasing** — a comment stays locatable by its diff snippet, not its line
   number. reviewr flags a stale comment instead of dropping it.
 

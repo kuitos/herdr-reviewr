@@ -6806,6 +6806,41 @@ fn comment_after_a_drag_quotes_the_span_and_anchors_to_its_line() {
 }
 
 #[test]
+fn a_settled_span_advertises_comment_span_beside_its_copy_status() {
+    let r = selection_repo();
+    let mut app = app_on(&r);
+    let footer = |app: &App| {
+        let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| herdr_reviewr::ui::render(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let y = SEL_AREA.height - 1;
+        (0..SEL_AREA.width).map(|x| buf.cell((x, y)).unwrap().symbol()).collect::<String>()
+    };
+    assert!(!footer(&app).contains("comment span"), "no span, no span action");
+
+    // A drag settles on the read pane with focus left on the navigator: `c` comments the
+    // span, and the footer's lead says so next to the copy's own status.
+    sel_drag(&mut app, (0, 6), (0, 9));
+    assert_eq!(app.footer_bands()[0], (FooterAction::CommentSpan, Band::Primary));
+    assert!(!app.footer_bands().iter().any(|&(a, _)| a == FooterAction::Comment));
+    let row = footer(&app);
+    assert!(row.contains("c comment span"), "footer: {row}");
+    assert!(row.contains("copied 4 chars"), "footer: {row}");
+
+    // With the cursor's own `comment` on the read pane, the span takes that slot instead of
+    // offering the key twice.
+    app.focus = Focus::Diff;
+    assert_eq!(app.footer_bands()[0], (FooterAction::CommentSpan, Band::Primary));
+    assert!(!app.footer_bands().iter().any(|&(a, _)| a == FooterAction::Comment));
+
+    // Any keypress clears the settled span, and the plain `comment` comes back.
+    press(&mut app, &Keymap::default(), KeyCode::Char('j'));
+    assert!(!app.footer_bands().iter().any(|&(a, _)| a == FooterAction::CommentSpan));
+    assert!(!footer(&app).contains("comment span"));
+}
+
+#[test]
 fn comment_after_a_double_click_quotes_the_word() {
     use herdr_reviewr::model::Quote;
     let r = selection_repo();

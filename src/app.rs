@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::config::Deliver;
 use crate::diff::{DiffCache, FileDiff, Row, View};
-use crate::export::{Agent, ExportTarget, format_all};
+use crate::export::{Agent, ExportTarget, format_all, format_quote};
 use crate::file_list::{self, Annotation, Entry, RowKind};
 use crate::forge;
 use crate::git;
@@ -534,6 +535,8 @@ pub fn find_case_sensitive(query: &str) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FooterAction {
     Comment,
+    /// `comment` over a settled text selection: the comment quotes the span.
+    CommentSpan,
     Select,
     ClearSelection,
     EditComment,
@@ -622,6 +625,16 @@ pub enum Band {
     Do,
     Go,
     Move,
+}
+
+/// What the agent picker's pick sends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PickerPurpose {
+    /// `send`: every written comment, as one batch.
+    SendAll,
+    /// An immediate delivery with several agents and none used yet: only the comment at this
+    /// store index, the one just saved.
+    DeliverOne(usize),
 }
 
 /// The file `edit` opens: a repository-relative path and the 1-based line to open it at
@@ -796,6 +809,9 @@ pub struct App {
     /// The mode the picker opened over — `Normal`, the comments list, or the find band —
     /// so closing it restores the view the reviewer sent from.
     pub picker_over: Mode,
+    /// What a pick sends: the whole set (`s`), or the one comment an immediate delivery could
+    /// not place on its own.
+    pub picker_purpose: PickerPurpose,
     /// The agent this session last sent to, which arms the picker's highlight. Only a
     /// successful send sets it.
     pub last_sent_pane: Option<String>,
@@ -990,6 +1006,7 @@ impl App {
             picker_rows: Vec::new(),
             picker_cursor: 0,
             picker_over: Mode::Normal,
+            picker_purpose: PickerPurpose::SendAll,
             last_sent_pane: None,
             base_picker: None,
             mode: Mode::Normal,
@@ -3373,6 +3390,15 @@ impl App {
         }
     }
 
+    /// Whether `comment` would quote the settled selection: a span of the read pane's source
+    /// text with something besides whitespace in it, exactly what [`Self::start_comment_with`]
+    /// anchors to.
+    fn settled_span_quotable(&self) -> bool {
+        self.settled_selection().and_then(|d| self.quotable_span(d)).is_some_and(|(lo, hi)| {
+            !crate::selection::read_text(&self.visible, lo, hi).trim().is_empty()
+        })
+    }
+
     /// The settled span `d` as endpoints on content rows of the open view, or `None` where it
     /// cannot anchor a comment: another surface, the read-only preview, or only fold rows.
     /// An end on a fold moves inward to the nearest content row, taken whole from there.
@@ -3787,6 +3813,7 @@ impl App {
             self.cancel_comment();
             return;
         }
+        let mut added = None;
         match editing {
             Some(i) => {
                 logln!("comment edit [{i}] :: {text}");
@@ -3796,13 +3823,20 @@ impl App {
             None => {
                 if let Some(c) = self.build_comment(text) {
                     logln!("comment add {} :: {}", c.location(), c.text);
-                    self.store.add(c);
+                    added = Some(self.store.add(c));
                     self.status = "comment added".to_string();
                 }
             }
         }
         self.select_anchor = None;
         self.leave_compose();
+        // Only a new comment goes out on its own: an edit changes one the agent may already
+        // hold, and a second copy would read as a second comment.
+        if let Some(idx) = added
+            && self.plugin_config().is_some_and(|c| c.deliver() == Deliver::Immediate)
+        {
+            self.deliver_one(idx);
+        }
     }
 
     /// Whether the selection has at least one content row a comment can attach to —
@@ -4549,6 +4583,17 @@ impl App {
             out.insert(at, (A::EditFile, Do));
         }
 
+        // A settled span `comment` would quote leads row 1, where the copy's `copied N chars`
+        // lands beside it: nothing else says `c` now comments the selection, not the cursor
+        // line. It takes the cursor's `comment` slot, and demotes any other primary.
+        if self.settled_span_quotable() {
+            out.retain(|&(a, _)| a != A::Comment);
+            if let Some(first) = out.first_mut().filter(|(_, band)| *band == Primary) {
+                first.1 = Do;
+            }
+            out.insert(0, (A::CommentSpan, Primary));
+        }
+
         // An armed crossing leads row 1: nothing else on screen says the next press leaves the
         // file. The cursor's own action stays, demoted — commenting still works here
         if let Some(forward) = self.armed_cross() {
@@ -4666,6 +4711,7 @@ impl App {
         self.picker_cursor = armed_row(&rows, self.last_sent_pane.as_deref());
         self.picker_rows = rows;
         self.picker_over = self.mode.clone();
+        self.picker_purpose = PickerPurpose::SendAll;
         self.mode = Mode::Picker;
     }
 
@@ -4677,6 +4723,7 @@ impl App {
         }
         self.picker_rows.clear();
         self.picker_cursor = 0;
+        self.picker_purpose = PickerPurpose::SendAll;
     }
 
     pub fn picker_move(&mut self, delta: isize) {
@@ -4693,13 +4740,70 @@ impl App {
         }
     }
 
-    /// Send every comment to the highlighted agent, then close whatever the outcome. A
-    /// failure reports and keeps the comments, so the reviewer can reopen a fresh picker
-    /// rather than retry against a frozen row.
+    /// Send to the highlighted agent — every comment, or the one an immediate delivery
+    /// opened the picker for — then close whatever the outcome. A failure reports and keeps
+    /// the comments, so the reviewer can reopen a fresh picker rather than retry against a
+    /// frozen row.
     pub fn picker_pick(&mut self) {
         let Some(agent) = self.picker_rows.get(self.picker_cursor).cloned() else { return };
+        let purpose = self.picker_purpose;
         self.close_picker();
-        self.export_to_agent(&agent);
+        match purpose {
+            PickerPurpose::SendAll => self.export_to_agent(&agent),
+            PickerPurpose::DeliverOne(idx) => self.deliver_to(idx, &agent),
+        }
+    }
+
+    /// `deliver = "immediate"`: put the comment just saved at `idx` into the agent's input box
+    /// on its own, as a quote. One agent takes it directly; with several, the one this session
+    /// sent to last does, and only a first delivery asks through the picker. Nothing is
+    /// focused: the reviewer stays on the review. Whatever keeps it from landing, the comment
+    /// stays, and `send` still delivers it later.
+    fn deliver_one(&mut self, idx: usize) {
+        match herdr::send_target() {
+            Ok(SendTarget::One(agent)) => self.deliver_to(idx, &agent),
+            Ok(SendTarget::Many(rows)) => {
+                let last = self.last_sent_pane.as_deref();
+                if let Some(agent) = rows.iter().find(|row| Some(row.pane_id.as_str()) == last) {
+                    let agent = agent.clone();
+                    self.deliver_to(idx, &agent);
+                } else {
+                    self.open_picker(rows);
+                    if self.mode == Mode::Picker {
+                        self.picker_purpose = PickerPurpose::DeliverOne(idx);
+                    }
+                }
+            }
+            Err(e) => self.status = format!("{} — comment kept", e.cause()),
+        }
+    }
+
+    /// Deliver the comment at `idx` to one decided agent, consuming it only once the text
+    /// landed. The agent must be ready first, like every send.
+    fn deliver_to(&mut self, idx: usize, agent: &AgentChoice) {
+        let Some(comment) = self.store.get(idx) else { return };
+        if let Err(not_ready) = herdr::target_ready(&agent.pane_id) {
+            self.status = format!("{} — comment kept", not_ready.cause());
+            logln!("deliver [{idx}] -> {} refused: {not_ready:?}", agent.pane_id);
+            return;
+        }
+        let text = format_quote(comment);
+        logln!("deliver [{idx}] -> {} ::\n{text}", agent.pane_id);
+        match herdr::deliver_quote(&agent.pane_id, &text) {
+            Ok(()) => {
+                self.store.take(idx);
+                self.last_sent_pane = Some(agent.pane_id.clone());
+                self.status = format!("sent to {}", agent.name);
+                self.clamp_list_cursor();
+                if self.store.is_empty() {
+                    self.close_list();
+                }
+            }
+            Err(e) => {
+                self.status = "agent not found — comment kept".to_string();
+                logln!("deliver ERR: {e:#}");
+            }
+        }
     }
 
     /// Whether the base picker can open here: a file tab and no `--base` flag, whatever the
@@ -5006,7 +5110,15 @@ impl App {
     /// picker was open fails here and keeps every comment. Only a
     /// delivery arms the next picker's highlight, and the pane comes from the row this send
     /// addressed, so `last used` can never name a pane the export did not reach.
+    ///
+    /// The agent must be ready first: a confirmation or a dialog on its screen would take the
+    /// batch as its answer, so the send writes nothing and keeps every comment.
     fn export_to_agent(&mut self, agent: &AgentChoice) {
+        if let Err(not_ready) = herdr::target_ready(&agent.pane_id) {
+            self.status = format!("{} — comments kept", not_ready.cause());
+            logln!("export -> {} refused: {not_ready:?}", agent.pane_id);
+            return;
+        }
         let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
         if self.export(&target) {
             self.last_sent_pane = Some(agent.pane_id.clone());

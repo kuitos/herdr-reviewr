@@ -172,10 +172,16 @@ impl Comment {
     /// The location, followed by the quoted span when the comment was made on one:
     /// `path:3 · 「text」`.
     pub fn heading(&self) -> String {
-        match &self.quote {
-            Some(q) => format!("{} · 「{}」", self.location(), q.label(QUOTE_LABEL_MAX)),
+        match self.quote_label() {
+            Some(q) => format!("{} · 「{q}」", self.location()),
             None => self.location(),
         }
+    }
+
+    /// The quoted span on one line, cut the way every heading cuts it, when the comment was
+    /// made on one.
+    pub fn quote_label(&self) -> Option<String> {
+        self.quote.as_ref().map(|q| q.label(QUOTE_LABEL_MAX))
     }
 
     /// The `path:start-end` (or `path:line`) location, with ` (removed)` when old-side.
