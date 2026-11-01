@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Replace an executable through a fresh inode, then ad-hoc re-sign on macOS.
-#
-# The one home for this dance: an in-place overwrite keeps the old inode, and macOS's
-# code-signing cache then SIGKILLs the binary at every launch (exit 137, no log line).
-# Both `just install` and `just qa-install` route through here.
-#
-#   swap-binary.sh <src> <dst>
+# swap-binary.sh <src> <dst>: replace an executable through a fresh inode and re-sign it, since
+# macOS SIGKILLs a binary overwritten in place at every launch. `just install` and qa-install use it.
 set -euo pipefail
 
 src="$1"

@@ -1,3 +1,7 @@
+# One line ending on every checkout, so a Windows clone matches `newline_style = "Unix"` in
+# rustfmt.toml and `cargo fmt --check` passes there too. Binary files are detected and left alone.
+* text=auto eol=lf
+
 # Fork: the fork and upstream both add sections at the top on every release; keep both
 # (the sync-upstream workflow merges upstream releases, so this would conflict every time).
 CHANGELOG.md merge=union

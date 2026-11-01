@@ -1,16 +1,47 @@
-//! A real on-disk git repo for integration tests. Every helper shells out to the
-//! actual `git` binary, so tests exercise the same surface the app does at runtime.
-//!
-//! `dead_code`/`unreachable_pub` are allowed because each test binary includes this
-//! module and uses only the subset of helpers it needs.
+//! A real git repo for integration tests, and the fake herdr; each binary uses a subset.
 #![allow(dead_code, unreachable_pub)]
+
+mod fixture;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use herdr_reviewr::app::App;
 use herdr_reviewr::model::Scope;
 use tempfile::TempDir;
+
+#[allow(unused_imports)]
+pub use fixture::fixture;
+
+/// The fake herdr, built here once per test process: `cargo test --test` builds no examples.
+pub fn fake_herdr() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let output = Command::new(env!("CARGO"))
+            .args(["build", "--example", "fake_herdr", "--message-format=json"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["target"]["name"] == "fake_herdr")
+            .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+            .expect("cargo reports the fake herdr's executable")
+    })
+}
+
+/// Every herdr call the fake in `dir` logged, one per line. Empty when herdr was never called.
+pub fn herdr_calls(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("herdr.log")).unwrap_or_default()
+}
+
+/// herdr's error envelope for `code`, as a failed CLI call writes it to stderr.
+pub fn herdr_error(code: &str) -> String {
+    serde_json::json!({"error": {"code": code, "message": "boom"}, "id": "cli:request"}).to_string()
+}
 
 pub struct Repo {
     dir: TempDir,
@@ -21,9 +52,7 @@ impl Repo {
     pub fn init() -> Self {
         let repo = Self { dir: TempDir::new().expect("tempdir") };
         repo.git(&["init", "-q", "-b", "main"]);
-        // The base chain reads `init.defaultBranch`, and `--get` sees the developer's
-        // global config. Pin it locally to a name no test creates, so the suite never
-        // depends on the machine it runs on.
+        // Pin `init.defaultBranch` so the machine's global config never steers a test.
         repo.git(&["config", "init.defaultBranch", "no-such-default"]);
         repo
     }
@@ -36,8 +65,7 @@ impl Repo {
         self.dir.path().to_path_buf()
     }
 
-    /// Like [`Self::git`] with extra environment variables — a pinned committer date makes
-    /// commit-recency ordering deterministic without sleeping across a clock tick.
+    /// [`Self::git`] with extra environment, such as a pinned committer date.
     pub fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> String {
         let out = Command::new("git")
             .env("GIT_AUTHOR_NAME", "Test")
@@ -63,8 +91,7 @@ impl Repo {
         self.git_env(args, &[])
     }
 
-    /// Fabricate a remote-tracking default branch without a real remote: a
-    /// `refs/remotes/origin/<name>` ref at the given rev plus the `origin/HEAD` symref.
+    /// Fake `origin/<name>` at `rev` as the remote default, with no real remote.
     pub fn set_origin_default(&self, name: &str, rev: &str) {
         let oid = self.git(&["rev-parse", rev]).trim().to_string();
         self.git(&["update-ref", &format!("refs/remotes/origin/{name}"), &oid]);
@@ -84,8 +111,7 @@ impl Repo {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// Record `content` as the base-pick blob verbatim, bypassing `write_base_pick` — for
-    /// the values only a foreign writer could put on this worktree's pick ref.
+    /// Write `content` to the pick ref verbatim, as only a foreign writer could.
     pub fn write_raw_base_pick(&self, content: &str) {
         self.plant_blob("refs/worktree/reviewr/base-pick", content);
     }
@@ -95,8 +121,7 @@ impl Repo {
         self.plant_blob("refs/reviewr/base-pick", content);
     }
 
-    /// A leftover path-hashed last-turn ref from before the worktree-private cutover,
-    /// using the FNV-1a key the old binary wrote.
+    /// The path-hashed last-turn ref an old binary left, before refs went worktree-private.
     pub fn plant_legacy_turn_base(&self, sha: &str) {
         let key = legacy_worktree_key(self.path());
         self.git(&["update-ref", &format!("refs/reviewr/turn-base/{key}"), sha]);
@@ -162,9 +187,7 @@ pub fn typed(app: &mut App, text: &str) {
     }
 }
 
-/// A minimal open-PR snapshot. Tests override only the fields they exercise:
-/// `PrSnapshot { comments, ..common::pr_snapshot() }` — so a new snapshot field
-/// touches this one literal instead of every test.
+/// A minimal open-PR snapshot to override per test: `PrSnapshot { .., ..pr_snapshot() }`.
 pub fn pr_snapshot() -> herdr_reviewr::forge::PrSnapshot {
     use herdr_reviewr::forge::{Merge, PrSnapshot, PrState, Sync};
     PrSnapshot {
@@ -187,8 +210,7 @@ pub fn pr_snapshot() -> herdr_reviewr::forge::PrSnapshot {
     }
 }
 
-/// A minimal PR conversation comment. Tests override the fields they exercise:
-/// `Comment { body: "...".into(), ..common::comment() }`.
+/// A minimal PR comment to override per test.
 pub fn comment() -> herdr_reviewr::forge::Comment {
     use herdr_reviewr::forge::{Comment, CommentKind};
     Comment {
@@ -206,8 +228,7 @@ pub fn comment() -> herdr_reviewr::forge::Comment {
     }
 }
 
-/// Switch to `tab` and service the deferred reload the switch schedules, so assertions run
-/// against the freshly reloaded state — the same sequence the event loop performs.
+/// Switch to `tab` and run its deferred reload, as the event loop does.
 pub fn enter_tab(app: &mut App, tab: herdr_reviewr::app::Tab) {
     app.set_tab(tab).unwrap();
     land_world(app);
@@ -218,4 +239,44 @@ pub fn land_world(app: &mut App) {
     let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
     app.reconcile_world(snapshot);
     app.world_request = None;
+}
+
+/// A pane over `repo` whose config sets `markdown_view = "rendered"`: markdown opens rendered.
+pub fn app_on_rendered(repo: &Repo) -> App {
+    app_on_config(repo, "markdown_view = \"rendered\"\n")
+}
+
+/// A pane over `repo` whose config sets `diff_view = "split"`: a wide diff opens split.
+pub fn app_on_split(repo: &Repo) -> App {
+    app_on_config(repo, "diff_view = \"split\"\n")
+}
+
+/// A unified row's content, for tests that read unified rows; panics on a split pair.
+pub trait UnifiedRow {
+    fn unified(&self) -> &herdr_reviewr::diff::Row;
+
+    fn text(&self) -> String {
+        self.unified().text()
+    }
+
+    fn marker(&self) -> char {
+        self.unified().marker()
+    }
+}
+
+impl UnifiedRow for herdr_reviewr::split::Visible {
+    fn unified(&self) -> &herdr_reviewr::diff::Row {
+        self.row().expect("a unified row")
+    }
+}
+
+/// A fresh pane over `repo`, seeded from a config file holding `toml`.
+pub fn app_on_config(repo: &Repo, toml: &str) -> App {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+    let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
+    let mut app = App::new(repo.path_buf(), Scope::Uncommitted, None);
+    app.seed_from_config(&config);
+    app.reload().unwrap();
+    app
 }

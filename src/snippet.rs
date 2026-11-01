@@ -1,10 +1,7 @@
-//! A stored PR finding hunk as Diff-view rows.
-//!
-//! This is a quotation, not a [`crate::diff::FileDiff`]. The live viewer owns folds,
-//! cursor, and comment targets. This module parses a unified-diff snippet, windows it
-//! to the finding's side and range, and highlights the kept rows.
+//! A PR finding's quoted hunk as highlighted rows, windowed to its side and range.
 
 use crate::diff::{Row, Span, compute_emphasis, language_of, set_row_spans};
+use crate::git::HunkHeader;
 use crate::highlight::Highlighter;
 use crate::model::Side;
 
@@ -49,8 +46,7 @@ pub fn rows_from_snippet(
             i += 1;
             on
         });
-        // `render_row` paints `new_no` first; on an old-side range copy `old_no` so the
-        // gutter matches `path:start-end`.
+        // The gutter paints `new_no`, so an old-side range shows its `old_no` there.
         if side == Side::Old {
             for row in &mut rows {
                 if let Row::Context { old_no, new_no, .. } = row {
@@ -69,9 +65,7 @@ pub fn rows_from_snippet(
     rows
 }
 
-/// One-slot memo for [`rows_from_snippet`]. The PR pane shows one finding at a time,
-/// so one key absorbs the per-frame highlight (`policies/ux-responsiveness.md`).
-/// Cleared on a theme switch — the key does not include the highlighter.
+/// One-slot memo for [`rows_from_snippet`], cleared on a theme switch.
 #[derive(Debug, Default)]
 pub struct SnippetRowCache {
     key: Option<(String, String, u32, u32, Side)>,
@@ -104,8 +98,7 @@ impl SnippetRowCache {
     }
 }
 
-/// `+` when the resolved side is new and the range has insertions, `-` when the
-/// side is old, otherwise no sign.
+/// The caption's sign: `+` for a new side with insertions, `-` for an old side.
 pub(crate) fn snippet_caption_sign(rows: &[Row], start: u32, end: u32, side: Side) -> Option<char> {
     match side {
         Side::Old => Some('-'),
@@ -118,18 +111,10 @@ pub(crate) fn snippet_caption_sign(rows: &[Row], start: u32, end: u32, side: Sid
     }
 }
 
-/// Whether this row is the comment subject (orange).
+/// Whether this row is the comment subject (in your comment color).
 pub(crate) fn snippet_row_is_comment(row: &Row, start: u32, end: u32, side: Side) -> bool {
     let (start, end) = ordered(start, end);
-    match row {
-        Row::Insertion { new_no, .. } => side == Side::New && in_span(*new_no, start, end),
-        Row::Deletion { old_no, .. } => side == Side::Old && in_span(*old_no, start, end),
-        Row::Context { old_no, new_no, .. } => match side {
-            Side::New => in_span(*new_no, start, end),
-            Side::Old => in_span(*old_no, start, end),
-        },
-        Row::Fold { .. } => false,
-    }
+    row.no(side).is_some_and(|n| in_span(n, start, end))
 }
 
 fn opposite_change(row: &Row, side: Side) -> bool {
@@ -143,9 +128,8 @@ fn parse_hunk(hunk: &str) -> (Vec<Row>, bool) {
     let mut numbered = false;
     for raw in hunk.lines() {
         if raw.starts_with("@@ ") {
-            if let Some((o, n)) = parse_hunk_header(raw) {
-                old_no = o;
-                new_no = n;
+            if let Some(hunk) = HunkHeader::parse(raw) {
+                (old_no, new_no) = (hunk.old.0, hunk.new.0);
                 numbered = true;
             }
             continue;
@@ -181,25 +165,12 @@ fn parse_hunk(hunk: &str) -> (Vec<Row>, bool) {
         };
         let spans = vec![Span { text: text.to_string(), color: (0, 0, 0) }];
         rows.push(match marker {
-            '+' => Row::Insertion { new_no: this_new, spans, emphasis: Vec::new() },
-            '-' => Row::Deletion { old_no: this_old, spans, emphasis: Vec::new() },
+            '+' => Row::Insertion { new_no: this_new, spans, emphasis: Vec::new(), cr: false },
+            '-' => Row::Deletion { old_no: this_old, spans, emphasis: Vec::new(), cr: false },
             _ => Row::Context { old_no: this_old, new_no: this_new, spans },
         });
     }
     (rows, numbered)
-}
-
-fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
-    let rest = line.strip_prefix("@@ ")?;
-    let mut parts = rest.split_whitespace();
-    let old = parts.next()?;
-    let new = parts.next()?;
-    if !old.starts_with('-') || !new.starts_with('+') {
-        return None;
-    }
-    let old_no = old[1..].split(',').next()?.parse().ok()?;
-    let new_no = new[1..].split(',').next()?.parse().ok()?;
-    Some((old_no, new_no))
 }
 
 fn change_blocks(rows: &[Row]) -> Vec<std::ops::Range<usize>> {

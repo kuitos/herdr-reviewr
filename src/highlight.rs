@@ -1,16 +1,12 @@
-//! Syntax highlighting via `syntect`, themed by the active theme's paired syntax theme.
-//!
-//! The highlighter is rebuilt when the theme
-//! changes and produces per-line foreground spans; the pane keeps the terminal's own
-//! background, so only token colors come from the theme.
+//! Syntax highlighting via `syntect`: foreground spans per line, from the theme's syntax theme.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Cursor;
 
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
+use syntect::parsing::{Scope, SyntaxSet};
 
 use std::sync::OnceLock;
 
@@ -20,25 +16,56 @@ use crate::theme::SyntaxChoice;
 /// The default text color when a theme carries none, or its syntax theme fails to load.
 const DEFAULT_FG: Rgb = (0xcd, 0xd6, 0xf4);
 
-/// The broad bat/two-face syntax set, built once per process (it is expensive to
-/// deserialize) and shared across every `Highlighter`.
+/// The two-face syntax set, deserialized once per process.
 fn syntaxes() -> &'static SyntaxSet {
     static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
     SYNTAXES.get_or_init(two_face::syntax::extra_newlines)
 }
 
-/// The two-face embedded theme set, deserialized once and shared — like [`syntaxes`], so a
-/// theme switch clones one theme out of the cached set instead of rebuilding the whole dump.
+/// The two-face theme set, deserialized once; a theme switch clones one theme out of it.
 fn embedded_themes() -> &'static two_face::theme::EmbeddedLazyThemeSet {
     static THEMES: OnceLock<two_face::theme::EmbeddedLazyThemeSet> = OnceLock::new();
     THEMES.get_or_init(two_face::theme::extra)
 }
 
-/// Holds the active syntax theme (absent when it failed to load); highlights file content
-/// into spans against the shared syntax set.
+/// The active syntax theme, `None` when it failed to load, which highlights as plain spans.
 pub struct Highlighter {
     theme: Option<Theme>,
     default_fg: Rgb,
+    markdown: MarkdownColors,
+}
+
+/// The colors a syntax theme gives rendered markdown, read once from its rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkdownColors {
+    /// H1 through H6; `None` where the theme sets no heading color.
+    pub headings: [Option<Rgb>; 6],
+    /// `None` where the theme sets no inline-code color.
+    pub inline_code: Option<Rgb>,
+}
+
+impl MarkdownColors {
+    /// Ask the theme under VS Code's and `TextMate`'s markdown scopes; highlighting a sample can't,
+    /// since the bundled grammar levels only H1 and H2.
+    fn of(theme: &Theme) -> Self {
+        let hl = syntect::highlighting::Highlighter::new(theme);
+        let fg = |stack: &[&str]| -> Option<Rgb> {
+            let scopes: Vec<Scope> = stack.iter().filter_map(|s| Scope::new(s).ok()).collect();
+            hl.style_mod_for_stack(&scopes).foreground.map(|c| (c.r, c.g, c.b))
+        };
+        // A rule for all markdown text is not a heading or code color.
+        let plain = fg(&["text.html.markdown"]);
+        let probe = |scope: &str| fg(&["text.html.markdown", scope]).filter(|c| Some(*c) != plain);
+        let headings = std::array::from_fn(|i| {
+            let n = i + 1;
+            probe(&format!("heading.{n}.markdown"))
+                .or_else(|| probe(&format!("markup.heading.{n}.markdown")))
+                .or_else(|| probe("markup.heading.markdown"))
+        });
+        let inline_code = probe("markup.inline.raw.string.markdown")
+            .or_else(|| probe("markup.raw.inline.markdown"));
+        Self { headings, inline_code }
+    }
 }
 
 impl fmt::Debug for Highlighter {
@@ -48,11 +75,7 @@ impl fmt::Debug for Highlighter {
 }
 
 impl Highlighter {
-    /// Build from a theme's paired syntax source: a bundled `.tmTheme` (parsed from vendored
-    /// bytes), or a theme from the `two-face` embedded set. A bundled theme that fails to
-    /// parse leaves the highlighter theme-less, so highlighting degrades to plain spans
-    /// rather than crashing. Most files color out of the box via the
-    /// broad two-face syntax set.
+    /// Build from a bundled `.tmTheme` or a `two-face` theme; one that fails to parse goes plain.
     pub fn new(syntax: SyntaxChoice) -> Self {
         let theme = match syntax {
             SyntaxChoice::Bundled(bytes) => {
@@ -70,28 +93,46 @@ impl Highlighter {
             .as_ref()
             .and_then(|t| t.settings.foreground)
             .map_or(DEFAULT_FG, |c| (c.r, c.g, c.b));
-        Self { theme, default_fg }
+        let markdown = theme.as_ref().map(MarkdownColors::of).unwrap_or_default();
+        Self { theme, default_fg, markdown }
     }
 
-    /// Highlight `content` line by line. Each inner `Vec` is one line's spans. With no
-    /// known `language` — or no loaded theme — every line is a single plain span in the
-    /// default color. `language` matches as an extension first (paths), then as a token
-    /// name (markdown fence tags like `rust` or `python`).
+    /// The theme's own colors for rendered markdown headings and inline code.
+    #[must_use]
+    pub fn markdown(&self) -> MarkdownColors {
+        self.markdown
+    }
+
+    /// Highlight `content` line by line.
     pub fn highlight(&self, content: &str, language: Option<&str>) -> Vec<Vec<Span>> {
+        self.highlight_lines(&crate::text::lines(content), language)
+    }
+
+    /// Highlight `lines` into spans per line, plain with no known language or theme.
+    pub fn highlight_lines(&self, lines: &[&str], language: Option<&str>) -> Vec<Vec<Span>> {
         let syntaxes = syntaxes();
         let syntax = language.and_then(|lang| {
             syntaxes.find_syntax_by_extension(lang).or_else(|| syntaxes.find_syntax_by_token(lang))
         });
         let (Some(syntax), Some(theme)) = (syntax, self.theme.as_ref()) else {
-            return content
-                .lines()
-                .map(|l| vec![Span { text: l.to_string(), color: self.default_fg }])
+            return lines
+                .iter()
+                .map(|l| {
+                    vec![Span {
+                        text: crate::text::line_body(l).0.to_string(),
+                        color: self.default_fg,
+                    }]
+                })
                 .collect();
         };
         let mut h = HighlightLines::new(syntax, theme);
         let mut out = Vec::new();
-        for line in LinesWithEndings::from(content) {
-            let spans = match h.highlight_line(line, syntaxes) {
+        for &line in lines {
+            // A CR-ended line highlights as its LF form.
+            let (text, cr) = crate::text::line_body(line);
+            let line: Cow<'_, str> =
+                if cr { Cow::Owned(format!("{text}\n")) } else { Cow::Borrowed(line) };
+            let spans = match h.highlight_line(&line, syntaxes) {
                 Ok(regions) => regions
                     .into_iter()
                     .map(|(style, text)| Span {
@@ -100,10 +141,7 @@ impl Highlighter {
                     })
                     .collect(),
                 // A grammar error degrades to plain text rather than blocking the diff.
-                Err(_) => vec![Span {
-                    text: line.trim_end_matches('\n').to_string(),
-                    color: self.default_fg,
-                }],
+                Err(_) => vec![Span { text: text.to_string(), color: self.default_fg }],
             };
             out.push(spans);
         }
@@ -142,13 +180,35 @@ mod tests {
     }
 
     #[test]
+    fn a_line_ending_cr_is_never_span_text() {
+        let h = Highlighter::new(mocha());
+        let text = |lines: Vec<Vec<super::Span>>| -> Vec<String> {
+            lines.iter().map(|l| l.iter().map(|s| s.text.as_str()).collect()).collect()
+        };
+        // A CRLF line, an LF line, a final bare CR; an inner CR stays.
+        let content = "let a = 1;\r\nlet b = 2;\nlet c\r= 3;\r";
+        let want = ["let a = 1;", "let b = 2;", "let c\r= 3;"];
+        assert_eq!(text(h.highlight(content, Some("rs"))), want);
+        assert_eq!(text(h.highlight(content, None)), want);
+        // The CRLF line tokenizes as its LF twin does.
+        assert_eq!(
+            h.highlight("let a = 1;\r\n", Some("rs")),
+            h.highlight("let a = 1;\n", Some("rs"))
+        );
+    }
+
+    #[test]
     fn bundled_syntax_themes_all_parse() {
-        // Each bundled `.tmTheme` must load, or highlighting silently degrades to plain spans
-        // A loaded theme tokenizes rust into more than one span; a failed
-        // load would yield a single plain span — so this guards the parse path for every
-        // bundled theme, the only `SyntaxChoice` that can fail.
-        for name in ["catppuccin", "tokyo-night", "tokyo-night-day", "rose-pine", "rose-pine-dawn"]
-        {
+        // Each bundled theme must load: a failed load would yield one plain span.
+        for name in [
+            "catppuccin",
+            "tokyo-night",
+            "tokyo-night-day",
+            "rose-pine",
+            "rose-pine-dawn",
+            "ayu",
+            "everforest",
+        ] {
             let h = Highlighter::new(theme::resolve(Some(name)).syntax);
             let spans = h.highlight("let x = 1;\n", Some("rs"));
             assert!(spans[0].len() > 1, "{name}: bundled syntax theme failed to load");

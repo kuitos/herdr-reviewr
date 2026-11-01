@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Build a throwaway repo for the demo recording (assets/demo.tape): a committed baseline plus an
-# uncommitted edit + a new file, so the Changes tab has a clear diff to review. It also writes a
-# tiny `herdr` stand-in so the send flow can complete. Kept out of the tape itself because vhs's
-# lexer can't carry the quoting.
+# The demo tape's throwaway repo (an edit and a new file) and a stand-in `herdr` for the send,
+# kept out of the tape because vhs's lexer can't carry the quoting.
 set -euo pipefail
 
 D="${1:-/tmp/herdr-reviewr-demo}"

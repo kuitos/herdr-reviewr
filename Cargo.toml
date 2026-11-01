@@ -1,6 +1,6 @@
 [package]
 name = "herdr-reviewr"
-version = "0.39.0-kuitos.2"
+version = "0.48.0-kuitos.1"
 edition = "2024"
 rust-version = "1.97"
 description = "A terminal review pane for herdr: browse an agent's changes and send comments back to chat."
@@ -15,12 +15,24 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 dirs = "7"
 fff-search = "0.11.0"
-# The `All files` walk outside a git repo, honoring `.gitignore` like `ls-files` would. Already
-# in the tree through fff-search, so it adds no crate.
-ignore = "0.4.33"
+# Already in the tree. Names each workspace's action lock file one-to-one.
+hex = "0.4"
 # The matcher fff-search scores with: the base picker ranks branch names by the same rule
 # as the search screen, over a plain string list.
 neo_frizbee = "0.13.3"
+# Already in the tree through fff-search. The watcher reads raw events: a debouncer crate ticks forever.
+notify = "=9.0.0-rc.5"
+# Already in the tree. Reads herdr's version against the minimum it needs.
+semver = "1.0.28"
+# Already in the tree through fff-search, which walks with it. Walks a folder that appears into the
+# search index, and on Linux the directories the watcher places a watch on.
+ignore = "0.4.33"
+# Pinned in the lockfile through ratatui's optional `palette` feature. WCAG contrast and OKLab
+# for the color roles, instead of hand-rolled matrices.
+palette = { version = "0.7.7", default-features = false, features = ["std"] }
+# herdr and the forge CLIs run in a process group (unix) or job object (Windows), so ending a
+# run ends its whole tree, `az.cmd`'s python included.
+process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group", "job-object"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
@@ -29,15 +41,54 @@ similar = { version = "3.2.0", features = ["text"] }
 # Dumps + fancy-regex only: no yaml-load (we read prebuilt binary syntax dumps, so the
 # unmaintained yaml-rust never enters the tree), no onig (pure-Rust regex engine).
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy", "dump-load", "plist-load"] }
+# The private index copies git refreshes and adds into (`git::IndexCopy`).
+tempfile = "3"
+# Already in the tree through ratatui's calendar widget. Parses RFC 3339 forge timestamps.
+time = { version = "0.3", features = ["parsing"] }
 toml = "1.1"
 two-face = "0.5.2"
 unicode-width = "0.2"
+# Program lookup the way a shell does it: the executable bit on unix, PATHEXT on Windows
+# (so `az` finds `az.cmd`), and never the current directory for a bare name.
+which = "8.0.6"
+
+[target.'cfg(unix)'.dependencies]
+# Already in the tree through crossterm. The frame loop's wait on the terminal and the wake pipe,
+# and the watcher's check for a network filesystem.
+rustix = { version = "1.1.5", features = ["event", "fs", "termios"] }
+# Already in the tree through crossterm. Writes a window resize into the wake pipe.
+signal-hook = "0.3.18"
+
+[target.'cfg(windows)'.dependencies]
+# The Win32 clipboard, written as UTF-16 so non-ASCII survives (`clip.exe` mangles it). Text
+# only: no image support, so no image codecs enter the tree.
+arboard = { version = "3.6.1", default-features = false }
+# The console calls behind the Windows input reader (`src/input/windows.rs`): its mode and its
+# input records. Already in the tree through crossterm.
+crossterm_winapi = "0.9.1"
+# herdr's Windows socket is a named pipe; the crate herdr serves it with connects to it, waiting
+# for a busy pipe only until the send's deadline. No default features, so no async runtime.
+interprocess = "2.4.4"
+# Opens a link through `ShellExecuteW` with no shell between, so an `&` in a URL can't
+# truncate or inject.
+opener = "0.9.0"
+# crossterm's unix input parser, published on its own, and its mapping onto crossterm's events:
+# the Windows reader parses the console's VT input with them (`src/input/vt.rs`).
+terminput = "0.5.15"
+terminput-crossterm = "0.4.11"
+# The waits, events and pipe cancel no safe wrapper offers: the frame loop's wait on console input
+# and its wake event, and cancelling a herdr subscription's read. The features are already on in the tree.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_IO", "Win32_System_Threading"] }
 
 [dev-dependencies]
-tempfile = "3"
+# The Windows input parser's tests run on every OS (`src/input/vt.rs`).
+terminput = "0.5.15"
+terminput-crossterm = "0.4.11"
 
 [lints.rust]
-unsafe_code = "forbid"
+# Deny, not forbid: on Windows the frame loop's wait (`src/wake.rs`) and the herdr
+# subscription's cancel (`src/herdr.rs`) allow it.
+unsafe_code = "deny"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 

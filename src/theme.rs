@@ -1,11 +1,5 @@
-//! The color model: named palettes, derivation from anchors, and selection.
-//!
-//! A theme is a few anchor colors plus a paired syntax theme;
-//! every other slot is derived from the anchors. One theme — `catppuccin` — instead
-//! pins its whole palette as a literal, to stay byte-identical to the pre-theming
-//! colors. One selection sets both the chrome `Palette` and the syntax theme, so they
-//! never desync. The pane background stays the terminal's, so only these fills and the
-//! syntax foregrounds are painted.
+//! The theme catalog: each theme's primitives, paired syntax theme, and own fills, one selection
+//! for both so they never desync; [`crate::roles`] derives every painted color from these.
 
 // This file is a color table; 6-digit `0xRRGGBB` literals read better grouped as one value.
 #![allow(clippy::unreadable_literal)]
@@ -13,19 +7,38 @@
 use ratatui::style::Color;
 use two_face::theme::EmbeddedThemeName;
 
+use crate::roles::{Cast, Fill, Overrides, Palette, Primitives};
+
 /// The default theme name; the fallback for an unset CLI value.
 pub const DEFAULT: &str = "catppuccin";
 
-/// A theme's intrinsic cast, which sets the derivation direction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Appearance {
-    Dark,
-    Light,
-}
+/// Every built-in theme, dark first. Names match herdr's where both ship a palette, so the value a
+/// user copies from their herdr config resolves to the same palette.
+pub const NAMES: [&str; 20] = [
+    "catppuccin",
+    "catppuccin-frappe",
+    "catppuccin-macchiato",
+    "catppuccin-latte",
+    "tokyo-night",
+    "tokyo-night-day",
+    "dracula",
+    "nord",
+    "gruvbox",
+    "gruvbox-light",
+    "one-dark",
+    "one-light",
+    "solarized",
+    "solarized-light",
+    "monokai",
+    "rose-pine",
+    "rose-pine-dawn",
+    "ayu",
+    "everforest",
+    "github-light",
+];
 
 /// The syntax theme paired with a palette: a bundled `.tmTheme`'s vendored bytes (for themes
-/// `two-face` lacks, and for Catppuccin Mocha kept byte-identical to today's), or a theme
-/// from the `two-face` embedded set.
+/// `two-face` lacks, and for Catppuccin Mocha), or a theme from the `two-face` embedded set.
 #[derive(Clone, Copy, Debug)]
 pub enum SyntaxChoice {
     Bundled(&'static [u8]),
@@ -40,241 +53,142 @@ pub struct Theme {
     pub syntax: SyntaxChoice,
 }
 
-/// The resolved colors every UI element paints — one source for chrome and diff fills.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Palette {
-    /// The theme's background anchor. Nothing paints it directly — the terminal supplies the
-    /// real background — but the modal scrim blends receding cells toward it.
-    pub base: Color,
-    pub surface0: Color,
-    pub surface1: Color,
-    pub surface2: Color,
-    pub dim2: Color,
-    pub dim1: Color,
-    pub dim0: Color,
-    pub text: Color,
-    pub red: Color,
-    pub green: Color,
-    pub yellow: Color,
-    pub orange: Color,
-    pub purple: Color,
-    pub blue: Color,
-    pub del_bg: Color,
-    pub ins_bg: Color,
-    pub emph_del_bg: Color,
-    pub emph_ins_bg: Color,
-    /// The search match highlight: a warm fill behind a matched substring, legible over a
-    /// plain row, a syntax-colored row, and the preview's banded hit line alike.
-    pub match_hl: Color,
-    /// The text-selection highlight, live and settled: a cool fill distinct by hue from the
-    /// `surface1`/`surface2` row fills, so a selection reads inside a cursor row in any pane
-    pub sel_bg: Color,
-}
-
-impl Palette {
-    /// The cursor-row fill: the strongest-contrast surface (`surface2`) in the focused pane, a
-    /// step softer (`surface1`) when not, so which pane holds the cursor reads at a glance.
-    /// ("Strongest", not "brightest": light themes step surfaces toward black, not white.)
-    pub fn cursor_bg(&self, focused: bool) -> Color {
-        if focused { self.surface2 } else { self.surface1 }
-    }
-
-    /// Lift a painted color onto a selection fill. The dim role (`dim2`) sits one surface
-    /// step above the fill and all but vanishes on it, so it rises to `dim0` and the
-    /// secondary parts of a selected row stay readable. Every other color
-    /// already reads there and passes through. Each theme names both ends, so the mapping means
-    /// the same thing in all of them.
-    pub fn on_fill(&self, color: Color) -> Color {
-        if color == self.dim2 { self.dim0 } else { color }
-    }
-
-    /// Recede a painted color behind an open modal: halfway to `base`, so the modal owns the
-    /// eye while the page behind stays recognizable. Non-RGB colors are the
-    /// terminal's own defaults, which have no known distance to `base`; they pass through.
-    pub fn scrim(&self, color: Color) -> Color {
-        match color {
-            Color::Rgb(..) => blend(color, self.base, 0.5),
-            other => other,
-        }
-    }
-}
-
 /// Resolve a theme name to a `Theme`. `None`, an unknown name, or a not-yet-supported
 /// one (including `terminal`) falls back to the default and logs; never a half-palette.
 pub fn resolve(name: Option<&str>) -> Theme {
-    match name {
-        None => catppuccin(),
-        Some(n) => build(n).unwrap_or_else(|| {
-            logln!("unknown theme {n:?}; using {DEFAULT}");
-            catppuccin()
-        }),
-    }
+    let name = name.unwrap_or(DEFAULT);
+    build(name).unwrap_or_else(|| {
+        logln!("unknown theme {name:?}; using {DEFAULT}");
+        build(DEFAULT).expect("the default theme is built in")
+    })
 }
 
-/// Whether `name` selects a complete built-in theme. Plugin configuration validates against
-/// this same catalog before a snapshot is applied.
+/// Whether `name` selects a built-in theme. Plugin configuration validates against this same
+/// catalog on every frame, so it checks the name without deriving a palette.
 pub fn is_known(name: &str) -> bool {
-    build(name).is_some()
+    NAMES.contains(&name)
 }
 
-/// The built theme for `name`, or `None` when it is not a known palette. Names match herdr's
-/// so the value a user copies from their herdr config resolves to the same palette.
+/// The built theme for `name`, or `None` when it is not a known palette.
 fn build(name: &str) -> Option<Theme> {
-    use Appearance::{Dark, Light};
+    let name = *NAMES.iter().find(|n| **n == name)?;
+    let (syntax, primitives, fills) = entry(name)?;
+    Some(Theme { name, palette: Palette::derive(primitives, fills), syntax })
+}
+
+/// A theme's syntax pairing, primitives, and the fills it sets itself.
+fn entry(name: &str) -> Option<(SyntaxChoice, Primitives, Overrides)> {
     use EmbeddedThemeName as E;
+    use SyntaxChoice::{Bundled, Embedded};
+    let none = Overrides::default();
     Some(match name {
-        "catppuccin" => catppuccin(),
-        "catppuccin-latte" => catppuccin_latte(),
-        "dracula" => derived("dracula", Dark, E::Dracula, DRACULA),
-        "nord" => derived("nord", Dark, E::Nord, NORD),
-        "gruvbox" => derived("gruvbox", Dark, E::GruvboxDark, GRUVBOX),
-        "gruvbox-light" => derived("gruvbox-light", Light, E::GruvboxLight, GRUVBOX_LIGHT),
-        "one-dark" => derived("one-dark", Dark, E::TwoDark, ONE_DARK),
-        "one-light" => derived("one-light", Light, E::OneHalfLight, ONE_LIGHT),
-        "solarized" => derived("solarized", Dark, E::SolarizedDark, SOLARIZED),
-        "solarized-light" => derived("solarized-light", Light, E::SolarizedLight, SOLARIZED_LIGHT),
-        // Popular themes beyond herdr's set, whose syntax `two-face` already provides.
-        "catppuccin-frappe" => derived("catppuccin-frappe", Dark, E::CatppuccinFrappe, FRAPPE),
-        "catppuccin-macchiato" => {
-            derived("catppuccin-macchiato", Dark, E::CatppuccinMacchiato, MACCHIATO)
-        }
-        "github-light" => derived("github-light", Light, E::Github, GITHUB_LIGHT),
-        "monokai" => derived("monokai", Dark, E::MonokaiExtended, MONOKAI),
-        // herdr names whose syntax `two-face` lacks, paired with a vendored `.tmTheme`.
-        "tokyo-night" => bundled("tokyo-night", Dark, TOKYO_NIGHT_TM, TOKYO_NIGHT),
-        "tokyo-night-day" => bundled("tokyo-night-day", Light, TOKYO_NIGHT_DAY_TM, TOKYO_NIGHT_DAY),
-        "rose-pine" => bundled("rose-pine", Dark, ROSE_PINE_TM, ROSE_PINE),
-        "rose-pine-dawn" => bundled("rose-pine-dawn", Light, ROSE_PINE_DAWN_TM, ROSE_PINE_DAWN),
+        "catppuccin" => (Bundled(MOCHA_TM), MOCHA, catppuccin_fills()),
+        "catppuccin-latte" => (Embedded(E::CatppuccinLatte), CATPPUCCIN_LATTE, none),
+        "catppuccin-frappe" => (Embedded(E::CatppuccinFrappe), FRAPPE, none),
+        "catppuccin-macchiato" => (Embedded(E::CatppuccinMacchiato), MACCHIATO, none),
+        "dracula" => (Embedded(E::Dracula), DRACULA, none),
+        "nord" => (Embedded(E::Nord), NORD, none),
+        "gruvbox" => (Embedded(E::GruvboxDark), GRUVBOX, none),
+        "gruvbox-light" => (Embedded(E::GruvboxLight), GRUVBOX_LIGHT, none),
+        "one-dark" => (Embedded(E::TwoDark), ONE_DARK, none),
+        "one-light" => (Embedded(E::OneHalfLight), ONE_LIGHT, none),
+        "solarized" => (Embedded(E::SolarizedDark), SOLARIZED, none),
+        "solarized-light" => (Embedded(E::SolarizedLight), SOLARIZED_LIGHT, none),
+        "github-light" => (Embedded(E::Github), GITHUB_LIGHT, none),
+        "monokai" => (Embedded(E::MonokaiExtended), MONOKAI, none),
+        // `two-face` lacks these syntax themes, so they pair with a vendored `.tmTheme`.
+        "tokyo-night" => (Bundled(TOKYO_NIGHT_TM), TOKYO_NIGHT, none),
+        "tokyo-night-day" => (Bundled(TOKYO_NIGHT_DAY_TM), TOKYO_NIGHT_DAY, none),
+        "rose-pine" => (Bundled(ROSE_PINE_TM), ROSE_PINE, none),
+        "rose-pine-dawn" => (Bundled(ROSE_PINE_DAWN_TM), ROSE_PINE_DAWN, none),
+        "ayu" => (Bundled(AYU_TM), AYU, none),
+        "everforest" => (Bundled(EVERFOREST_TM), EVERFOREST, everforest_fills()),
         _ => return None,
     })
 }
 
-/// A derived theme: its palette is computed from `anchors`, paired with a `two-face` syntax theme.
-fn derived(
-    name: &'static str,
-    appearance: Appearance,
-    syntax: EmbeddedThemeName,
-    anchors: Anchors,
-) -> Theme {
-    Theme { name, palette: derive(anchors, appearance), syntax: SyntaxChoice::Embedded(syntax) }
+/// Catppuccin ships its own surfaces and diff fills, so they enter the roles as given.
+fn catppuccin_fills() -> Overrides {
+    Overrides::default()
+        .fill(Fill::Bar, hex(0x313244))
+        .fill(Fill::Code, hex(0x313244))
+        .fill(Fill::CursorInactive, hex(0x45475a))
+        .fill(Fill::Cursor, hex(0x585b70))
+        .fill(Fill::Removed, hex(0x45232f))
+        .fill(Fill::Added, hex(0x1f3a2a))
+        .fill(Fill::RemovedEmph, hex(0x6e3446))
+        .fill(Fill::AddedEmph, hex(0x30553f))
+        .fill(Fill::Selection, hex(0x353d7d))
 }
 
-/// The anchor colors a derived theme lists; the rest of its palette is computed from these.
-#[derive(Clone, Copy, Debug)]
-struct Anchors {
-    base: Color,
-    text: Color,
-    red: Color,
-    green: Color,
-    yellow: Color,
-    orange: Color,
-    purple: Color,
-    blue: Color,
+/// Everforest ships its diff row fills (`bg_green`, `bg_red`), so the rows match the Neovim
+/// theme. It has no word-emphasis fills, so those stay derived.
+fn everforest_fills() -> Overrides {
+    Overrides::default().fill(Fill::Added, hex(0x3c4841)).fill(Fill::Removed, hex(0x493b40))
 }
 
-/// Catppuccin Mocha: pinned to its canonical values so it renders identically to the
-/// pre-theming palette.
-fn catppuccin() -> Theme {
-    Theme {
-        name: "catppuccin",
-        palette: Palette {
-            base: Color::Rgb(0x1e, 0x1e, 0x2e),
-            surface0: Color::Rgb(0x31, 0x32, 0x44),
-            surface1: Color::Rgb(0x45, 0x47, 0x5a),
-            surface2: Color::Rgb(0x58, 0x5b, 0x70),
-            dim2: Color::Rgb(0x6c, 0x70, 0x86),
-            dim1: Color::Rgb(0x7f, 0x84, 0x9c),
-            dim0: Color::Rgb(0xa6, 0xad, 0xc8),
-            text: Color::Rgb(0xcd, 0xd6, 0xf4),
-            red: Color::Rgb(0xf3, 0x8b, 0xa8),
-            green: Color::Rgb(0xa6, 0xe3, 0xa1),
-            yellow: Color::Rgb(0xf9, 0xe2, 0xaf),
-            orange: Color::Rgb(0xfa, 0xb3, 0x87),
-            purple: Color::Rgb(0xcb, 0xa6, 0xf7),
-            blue: Color::Rgb(0xb4, 0xbe, 0xfe),
-            del_bg: Color::Rgb(0x45, 0x23, 0x2f),
-            ins_bg: Color::Rgb(0x1f, 0x3a, 0x2a),
-            emph_del_bg: Color::Rgb(0x6e, 0x34, 0x46),
-            emph_ins_bg: Color::Rgb(0x30, 0x55, 0x3f),
-            match_hl: Color::Rgb(0x5c, 0x51, 0x2b),
-            sel_bg: Color::Rgb(0x35, 0x3d, 0x7d),
-        },
-        syntax: SyntaxChoice::Bundled(MOCHA_TM),
-    }
-}
-
-/// A theme whose palette is derived from `anchors`, paired with a bundled `.tmTheme`'s bytes.
-fn bundled(
-    name: &'static str,
-    appearance: Appearance,
-    syntax: &'static [u8],
-    anchors: Anchors,
-) -> Theme {
-    Theme { name, palette: derive(anchors, appearance), syntax: SyntaxChoice::Bundled(syntax) }
-}
-
-/// Vendored `.tmTheme` assets for the syntax themes `two-face` does not carry (and Mocha,
-/// kept as the byte-identical source of today's highlighting). Licenses listed in the
-/// README's License section.
+/// Vendored `.tmTheme` assets for the syntax themes `two-face` does not carry, and Mocha.
+/// Licenses listed in the README's License section.
 const MOCHA_TM: &[u8] = include_bytes!("../assets/Catppuccin Mocha.tmTheme");
 const TOKYO_NIGHT_TM: &[u8] = include_bytes!("../assets/tokyo-night.tmTheme");
 const TOKYO_NIGHT_DAY_TM: &[u8] = include_bytes!("../assets/tokyo-night-day.tmTheme");
 const ROSE_PINE_TM: &[u8] = include_bytes!("../assets/rose-pine.tmTheme");
 const ROSE_PINE_DAWN_TM: &[u8] = include_bytes!("../assets/rose-pine-dawn.tmTheme");
+const AYU_TM: &[u8] = include_bytes!("../assets/ayu-dark.tmTheme");
+const EVERFOREST_TM: &[u8] = include_bytes!("../assets/everforest.tmTheme");
 
-/// Catppuccin Latte: a light theme, derived from its anchors to exercise the derivation
-/// path (and paired with `two-face`'s Latte syntax theme).
-fn catppuccin_latte() -> Theme {
-    derived(
-        "catppuccin-latte",
-        Appearance::Light,
-        EmbeddedThemeName::CatppuccinLatte,
-        CATPPUCCIN_LATTE,
-    )
-}
+/// Catppuccin Mocha: its canonical values, with herdr's blue as the accent.
+const MOCHA: Primitives =
+    dark(0x1e1e2e, 0xcdd6f4, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0xfab387, 0xcba6f7, 0xb4befe, 0x89b4fa);
+const CATPPUCCIN_LATTE: Primitives =
+    light(0xeff1f5, 0x4c4f69, 0xd20f39, 0x40a02b, 0xdf8e1d, 0xfe640b, 0x8839ef, 0x7287fd, 0x1e66f5);
+/// The rest, by canonical values: base, text, red, green, yellow, orange, purple, blue, and
+/// the UI accent.
+const DRACULA: Primitives =
+    dark(0x282a36, 0xf8f8f2, 0xff5555, 0x50fa7b, 0xf1fa8c, 0xffb86c, 0xbd93f9, 0x8be9fd, 0xbd93f9);
+const NORD: Primitives =
+    dark(0x2e3440, 0xd8dee9, 0xbf616a, 0xa3be8c, 0xebcb8b, 0xd08770, 0xb48ead, 0x81a1c1, 0x88c0d0);
+const GRUVBOX: Primitives =
+    dark(0x282828, 0xebdbb2, 0xfb4934, 0xb8bb26, 0xfabd2f, 0xfe8019, 0xd3869b, 0x83a598, 0xd79921);
+const GRUVBOX_LIGHT: Primitives =
+    light(0xfbf1c7, 0x3c3836, 0x9d0006, 0x79740e, 0xb57614, 0xaf3a03, 0x8f3f71, 0x076678, 0x076678);
+const ONE_DARK: Primitives =
+    dark(0x282c34, 0xabb2bf, 0xe06c75, 0x98c379, 0xe5c07b, 0xd19a66, 0xc678dd, 0x61afef, 0x61afef);
+const ONE_LIGHT: Primitives =
+    light(0xfafafa, 0x383a42, 0xe45649, 0x50a14f, 0xc18401, 0x986801, 0xa626a4, 0x4078f2, 0x4078f2);
+const SOLARIZED: Primitives =
+    dark(0x002b36, 0x93a1a1, 0xdc322f, 0x859900, 0xb58900, 0xcb4b16, 0x6c71c4, 0x268bd2, 0x268bd2);
+const SOLARIZED_LIGHT: Primitives =
+    light(0xfdf6e3, 0x586e75, 0xdc322f, 0x859900, 0xb58900, 0xcb4b16, 0x6c71c4, 0x268bd2, 0x268bd2);
+const FRAPPE: Primitives =
+    dark(0x303446, 0xc6d0f5, 0xe78284, 0xa6d189, 0xe5c890, 0xef9f76, 0xca9ee6, 0xbabbf1, 0x8caaee);
+const MACCHIATO: Primitives =
+    dark(0x24273a, 0xcad3f5, 0xed8796, 0xa6da95, 0xeed49f, 0xf5a97f, 0xc6a0f6, 0xb7bdf8, 0x8aadf4);
+const GITHUB_LIGHT: Primitives =
+    light(0xffffff, 0x1f2328, 0xcf222e, 0x1a7f37, 0x9a6700, 0xbc4c00, 0x8250df, 0x0969da, 0x0969da);
+const MONOKAI: Primitives =
+    dark(0x272822, 0xf8f8f2, 0xf92672, 0xa6e22e, 0xe6db74, 0xfd971f, 0xae81ff, 0x66d9ef, 0x66d9ef);
+const TOKYO_NIGHT: Primitives =
+    dark(0x1a1b26, 0xc0caf5, 0xf7768e, 0x9ece6a, 0xe0af68, 0xff9e64, 0xbb9af7, 0x7aa2f7, 0x7aa2f7);
+const TOKYO_NIGHT_DAY: Primitives =
+    light(0xe1e2e7, 0x3760bf, 0xf52a65, 0x587539, 0x8c6c3e, 0xb15c00, 0x9854f1, 0x2e7de9, 0x2e7de9);
+const ROSE_PINE: Primitives =
+    dark(0x191724, 0xe0def4, 0xeb6f92, 0x9ccfd8, 0xf6c177, 0xebbcba, 0xc4a7e7, 0x31748f, 0xc4a7e7);
+const ROSE_PINE_DAWN: Primitives =
+    light(0xfaf4ed, 0x575279, 0xb4637a, 0x56949f, 0xea9d34, 0xd7827e, 0x907aa9, 0x286983, 0x907aa9);
+/// ayu Dark from `ayu-colors` 9.1: `ui.bg`, `editor.fg`, its syntax palette, and its blue as the
+/// accent, as herdr paints ayu: `common.accent` gold reads as "modified" yellow.
+const AYU: Primitives =
+    dark(0x0d1017, 0xbfbdb6, 0xf07178, 0xaad94c, 0xffb454, 0xff8f40, 0xd2a6ff, 0x59c2ff, 0x59c2ff);
+/// Everforest dark, hard background: `bg0`, `fg` and the accents from `autoload/everforest.vim`.
+/// The accent is its aqua: upstream's green accent is its "added" color.
+const EVERFOREST: Primitives =
+    dark(0x272e33, 0xd3c6aa, 0xe67e80, 0xa7c080, 0xdbbc7f, 0xe69875, 0xd699b6, 0x7fbbb3, 0x7fbbb3);
 
-const CATPPUCCIN_LATTE: Anchors =
-    anchors(0xeff1f5, 0x4c4f69, 0xd20f39, 0x40a02b, 0xdf8e1d, 0xfe640b, 0x8839ef, 0x7287fd);
-
-/// Canonical anchors for the derived themes. base, text, then the six accents
-/// (red, green, yellow, orange, purple, blue); surfaces and diff fills are derived.
-const DRACULA: Anchors =
-    anchors(0x282a36, 0xf8f8f2, 0xff5555, 0x50fa7b, 0xf1fa8c, 0xffb86c, 0xbd93f9, 0x8be9fd);
-const NORD: Anchors =
-    anchors(0x2e3440, 0xd8dee9, 0xbf616a, 0xa3be8c, 0xebcb8b, 0xd08770, 0xb48ead, 0x81a1c1);
-const GRUVBOX: Anchors =
-    anchors(0x282828, 0xebdbb2, 0xfb4934, 0xb8bb26, 0xfabd2f, 0xfe8019, 0xd3869b, 0x83a598);
-const GRUVBOX_LIGHT: Anchors =
-    anchors(0xfbf1c7, 0x3c3836, 0x9d0006, 0x79740e, 0xb57614, 0xaf3a03, 0x8f3f71, 0x076678);
-const ONE_DARK: Anchors =
-    anchors(0x282c34, 0xabb2bf, 0xe06c75, 0x98c379, 0xe5c07b, 0xd19a66, 0xc678dd, 0x61afef);
-const ONE_LIGHT: Anchors =
-    anchors(0xfafafa, 0x383a42, 0xe45649, 0x50a14f, 0xc18401, 0x986801, 0xa626a4, 0x4078f2);
-const SOLARIZED: Anchors =
-    anchors(0x002b36, 0x93a1a1, 0xdc322f, 0x859900, 0xb58900, 0xcb4b16, 0x6c71c4, 0x268bd2);
-const SOLARIZED_LIGHT: Anchors =
-    anchors(0xfdf6e3, 0x586e75, 0xdc322f, 0x859900, 0xb58900, 0xcb4b16, 0x6c71c4, 0x268bd2);
-const FRAPPE: Anchors =
-    anchors(0x303446, 0xc6d0f5, 0xe78284, 0xa6d189, 0xe5c890, 0xef9f76, 0xca9ee6, 0xbabbf1);
-const MACCHIATO: Anchors =
-    anchors(0x24273a, 0xcad3f5, 0xed8796, 0xa6da95, 0xeed49f, 0xf5a97f, 0xc6a0f6, 0xb7bdf8);
-const GITHUB_LIGHT: Anchors =
-    anchors(0xffffff, 0x1f2328, 0xcf222e, 0x1a7f37, 0x9a6700, 0xbc4c00, 0x8250df, 0x0969da);
-const MONOKAI: Anchors =
-    anchors(0x272822, 0xf8f8f2, 0xf92672, 0xa6e22e, 0xe6db74, 0xfd971f, 0xae81ff, 0x66d9ef);
-const TOKYO_NIGHT: Anchors =
-    anchors(0x1a1b26, 0xc0caf5, 0xf7768e, 0x9ece6a, 0xe0af68, 0xff9e64, 0xbb9af7, 0x7aa2f7);
-const TOKYO_NIGHT_DAY: Anchors =
-    anchors(0xe1e2e7, 0x3760bf, 0xf52a65, 0x587539, 0x8c6c3e, 0xb15c00, 0x9854f1, 0x2e7de9);
-const ROSE_PINE: Anchors =
-    anchors(0x191724, 0xe0def4, 0xeb6f92, 0x9ccfd8, 0xf6c177, 0xebbcba, 0xc4a7e7, 0x31748f);
-const ROSE_PINE_DAWN: Anchors =
-    anchors(0xfaf4ed, 0x575279, 0xb4637a, 0x56949f, 0xea9d34, 0xd7827e, 0x907aa9, 0x286983);
-
-/// Build `Anchors` from `0xRRGGBB` hex literals, so a palette reads as one compact row.
-/// One argument per anchor slot — the count is the palette's shape, not accidental.
+/// A dark theme's primitives from `0xRRGGBB` literals, so a palette reads as one compact row:
+/// base, text, red, green, yellow, orange, purple, blue, accent.
 #[allow(clippy::too_many_arguments)]
-const fn anchors(
+const fn dark(
     base: u32,
     text: u32,
     red: u32,
@@ -283,16 +197,39 @@ const fn anchors(
     orange: u32,
     purple: u32,
     blue: u32,
-) -> Anchors {
-    Anchors {
-        base: hex(base),
-        text: hex(text),
-        red: hex(red),
-        green: hex(green),
-        yellow: hex(yellow),
-        orange: hex(orange),
-        purple: hex(purple),
-        blue: hex(blue),
+    accent: u32,
+) -> Primitives {
+    primitives(Cast::Dark, [base, text, red, green, yellow, orange, purple, blue, accent])
+}
+
+/// A light theme's primitives, in [`dark`]'s order.
+#[allow(clippy::too_many_arguments)]
+const fn light(
+    base: u32,
+    text: u32,
+    red: u32,
+    green: u32,
+    yellow: u32,
+    orange: u32,
+    purple: u32,
+    blue: u32,
+    accent: u32,
+) -> Primitives {
+    primitives(Cast::Light, [base, text, red, green, yellow, orange, purple, blue, accent])
+}
+
+const fn primitives(cast: Cast, c: [u32; 9]) -> Primitives {
+    Primitives {
+        base: hex(c[0]),
+        text: hex(c[1]),
+        red: hex(c[2]),
+        green: hex(c[3]),
+        yellow: hex(c[4]),
+        orange: hex(c[5]),
+        purple: hex(c[6]),
+        blue: hex(c[7]),
+        accent: hex(c[8]),
+        cast,
     }
 }
 
@@ -301,178 +238,39 @@ const fn hex(rgb: u32) -> Color {
     Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-/// Build a full palette from anchors: surfaces step `base` toward the contrast pole
-/// (lighter for a dark theme, darker for a light one); diff fills tint `base` with the
-/// add/remove accent, kept legible against `text`.
-fn derive(a: Anchors, appearance: Appearance) -> Palette {
-    let pole = match appearance {
-        Appearance::Dark => WHITE,
-        Appearance::Light => BLACK,
-    };
-    let surface = |t: f64| blend(a.base, pole, t);
-    Palette {
-        base: a.base,
-        surface0: surface(0.045),
-        surface1: surface(0.09),
-        surface2: surface(0.14),
-        dim2: surface(0.26),
-        dim1: surface(0.34),
-        dim0: blend(a.text, a.base, 0.18),
-        text: a.text,
-        red: a.red,
-        green: a.green,
-        yellow: a.yellow,
-        orange: a.orange,
-        purple: a.purple,
-        blue: a.blue,
-        del_bg: readable_tint(a.red, a.base, a.text, appearance, false),
-        ins_bg: readable_tint(a.green, a.base, a.text, appearance, false),
-        emph_del_bg: readable_tint(a.red, a.base, a.text, appearance, true),
-        emph_ins_bg: readable_tint(a.green, a.base, a.text, appearance, true),
-        match_hl: readable_tint(a.yellow, a.base, a.text, appearance, true),
-        sel_bg: readable_tint(saturated(a.blue), a.base, a.text, appearance, true),
-    }
-}
-
-const WHITE: Color = Color::Rgb(0xff, 0xff, 0xff);
-const BLACK: Color = Color::Rgb(0x00, 0x00, 0x00);
-
-/// The lowest contrast a diff fill keeps against the row's text, so code on a fill stays
-/// legible on any base.
-const MIN_FILL_CONTRAST: f64 = 4.5;
-
-/// Lift a syntax `fg` painted on `fill` just enough that the fill costs it no legibility: to
-/// its own contrast on the plain `base`, capped at [`MIN_FILL_CONTRAST`].
-///
-/// [`readable_tint`] floors a fill against the palette's `text` only, so a dim syntax color —
-/// a code comment, above all — can drop far lower on the same fill. Other tools keep the
-/// syntax color and never check. Lifting everything to the floor instead erases syntax hue on
-/// themes whose fills sit near it. Holding each color to its own plain-background contrast
-/// keeps it as readable as it was, and keeps a comment dimmer than code. `toward` is the
-/// palette's `text`, so this lightens on a dark theme and darkens on a light one; a color
-/// already at its target comes back unchanged.
-pub fn legible(fg: Color, fill: Color, base: Color, toward: Color) -> Color {
-    let target = contrast(fg, base).min(MIN_FILL_CONTRAST);
-    let mut t = 0.0;
-    while t < 1.0 {
-        let lifted = blend(fg, toward, t);
-        if contrast(lifted, fill) >= target {
-            return lifted;
-        }
-        t += 0.02;
-    }
-    toward
-}
-
-/// A diff-row fill: tint `base` with `accent`, stepping the tint down from its start strength
-/// until the row's `fg` clears [`MIN_FILL_CONTRAST`]. `strong` is the brighter word-emphasis
-/// fill. When even a faint tint can't clear the floor (a light theme with light text), the
-/// bare `base` wins — legibility over a visible tint.
-fn readable_tint(
-    accent: Color,
-    base: Color,
-    fg: Color,
-    appearance: Appearance,
-    strong: bool,
-) -> Color {
-    let start = match (appearance, strong) {
-        (Appearance::Dark, false) => 0.20,
-        (Appearance::Dark, true) => 0.38,
-        (Appearance::Light, false) => 0.12,
-        (Appearance::Light, true) => 0.22,
-    };
-    let mut t = start;
-    while t > 0.0 {
-        let fill = blend(base, accent, t);
-        if contrast(fg, fill) >= MIN_FILL_CONTRAST {
-            return fill;
-        }
-        t -= 0.02;
-    }
-    base
-}
-
-/// Halfway between an accent and its colorful core — the shared gray component removed and
-/// the remainder rescaled to full range. A pastel anchor (Catppuccin's periwinkle `blue`)
-/// tints `base` into the same gray family as the surface fills; the saturated version tints
-/// it into an unmistakable hue instead, which is what lets the selection fill read inside a
-/// cursor row. A gray anchor has no hue to amplify and passes through.
-fn saturated(c: Color) -> Color {
-    let (r, g, b) = channels(c);
-    let lo = r.min(g).min(b);
-    let span = r.max(g).max(b) - lo;
-    if span == 0 {
-        return c;
-    }
-    let core = |ch: u8| (f64::from(ch - lo) * 255.0 / f64::from(span)).round() as u8;
-    blend(c, Color::Rgb(core(r), core(g), core(b)), 0.5)
-}
-
-/// Linear per-channel blend: `t` of the way from `from` to `to` (0.0 = `from`, 1.0 = `to`).
-fn blend(from: Color, to: Color, t: f64) -> Color {
-    let (fr, fg, fb) = channels(from);
-    let (tr, tg, tb) = channels(to);
-    let mix = |lhs: u8, rhs: u8| (f64::from(lhs) * (1.0 - t) + f64::from(rhs) * t).round() as u8;
-    Color::Rgb(mix(fr, tr), mix(fg, tg), mix(fb, tb))
-}
-
-/// The WCAG contrast ratio between two colors (1.0 .. 21.0).
-fn contrast(fg: Color, bg: Color) -> f64 {
-    let (lf, lb) = (luminance(fg), luminance(bg));
-    let (hi, lo) = if lf >= lb { (lf, lb) } else { (lb, lf) };
-    (hi + 0.05) / (lo + 0.05)
-}
-
-/// WCAG relative luminance, with sRGB linearization.
-fn luminance(color: Color) -> f64 {
-    let (r, g, b) = channels(color);
-    let lin = |channel: u8| {
-        let srgb = f64::from(channel) / 255.0;
-        if srgb <= 0.03928 { srgb / 12.92 } else { ((srgb + 0.055) / 1.055).powf(2.4) }
-    };
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
-}
-
-/// The RGB channels of a color; anchors are always `Rgb`, so the fallback never fires.
-fn channels(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (0, 0, 0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        Appearance, CATPPUCCIN_LATTE, MIN_FILL_CONTRAST, Palette, contrast, derive, legible,
-        resolve,
+    use super::{NAMES, entry, resolve};
+    use crate::roles::{
+        Cast, FILL_SEP, FILLS, Fill, INK_SEP, INKS, Ink, LAYERS, MARK_FLOOR, TEXT_FLOOR, TIER_STEP,
+        contrast, oklab_distance,
     };
     use ratatui::style::Color;
 
-    #[test]
-    fn contrast_black_white_is_max() {
-        let r = contrast(Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255));
-        assert!((r - 21.0).abs() < 0.01, "black vs white is ~21:1, got {r}");
+    fn rgb(hex: u32) -> Color {
+        Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
     }
 
     #[test]
-    fn catppuccin_is_the_unchanged_mocha_palette() {
+    fn catppuccin_keeps_its_own_surfaces_and_fills() {
         let p = resolve(Some("catppuccin")).palette;
-        assert_eq!(p.surface0, Color::Rgb(0x31, 0x32, 0x44));
-        assert_eq!(p.text, Color::Rgb(0xcd, 0xd6, 0xf4));
-        assert_eq!(p.del_bg, Color::Rgb(0x45, 0x23, 0x2f));
-        assert_eq!(p.ins_bg, Color::Rgb(0x1f, 0x3a, 0x2a));
-        // The renamed slots keep their Mocha values: orange was peach, purple mauve,
-        // blue lavender, and dim0/1/2 were subtext0/overlay1/overlay0.
-        assert_eq!(p.orange, Color::Rgb(0xfa, 0xb3, 0x87));
-        assert_eq!(p.purple, Color::Rgb(0xcb, 0xa6, 0xf7));
-        assert_eq!(p.blue, Color::Rgb(0xb4, 0xbe, 0xfe));
-        assert_eq!(p.dim0, Color::Rgb(0xa6, 0xad, 0xc8));
-        assert_eq!(p.dim1, Color::Rgb(0x7f, 0x84, 0x9c));
-        assert_eq!(p.dim2, Color::Rgb(0x6c, 0x70, 0x86));
-        // The selection fill: saturated `blue` tinted over `base` at emphasis strength — a
-        // real hue, nothing near the gray `surface1`/`surface2` cursor fills.
-        assert_eq!(p.sel_bg, Color::Rgb(0x35, 0x3d, 0x7d));
+        assert_eq!(p.fill(Fill::Bar), Color::Rgb(0x31, 0x32, 0x44));
+        assert_eq!(p.fill(Fill::Cursor), Color::Rgb(0x58, 0x5b, 0x70));
+        assert_eq!(p.fill(Fill::Removed), Color::Rgb(0x45, 0x23, 0x2f));
+        assert_eq!(p.fill(Fill::Added), Color::Rgb(0x1f, 0x3a, 0x2a));
+        assert_eq!(p.fill(Fill::Selection), Color::Rgb(0x35, 0x3d, 0x7d));
+        assert_eq!(p.ink(Ink::Text, Fill::Base), Color::Rgb(0xcd, 0xd6, 0xf4));
+        assert_eq!(p.ink(Ink::Comment, Fill::Base), Color::Rgb(0xfa, 0xb3, 0x87));
+    }
+
+    #[test]
+    fn everforest_diff_rows_use_its_own_palette_fills() {
+        let p = resolve(Some("everforest")).palette;
+        assert_eq!(p.fill(Fill::Added), Color::Rgb(0x3c, 0x48, 0x41));
+        assert_eq!(p.fill(Fill::Removed), Color::Rgb(0x49, 0x3b, 0x40));
+        // Everything else still comes from its primitives.
+        assert_eq!(p.fill(Fill::Base), Color::Rgb(0x27, 0x2e, 0x33));
+        assert_eq!(p.ink(Ink::Text, Fill::Base), Color::Rgb(0xd3, 0xc6, 0xaa));
     }
 
     #[test]
@@ -480,34 +278,36 @@ mod tests {
         assert_eq!(resolve(Some("nope")).name, "catppuccin");
         assert_eq!(resolve(Some("terminal")).name, "catppuccin");
         assert_eq!(resolve(None).name, "catppuccin");
+        assert!(!super::is_known("terminal"));
+        assert!(NAMES.iter().all(|name| super::is_known(name)));
     }
 
     #[test]
-    fn latte_is_a_selectable_light_theme() {
-        assert_eq!(resolve(Some("catppuccin-latte")).name, "catppuccin-latte");
-    }
-
-    #[test]
-    fn an_emphasized_color_keeps_its_plain_background_legibility() {
-        // Tokyo Night's comment color: on the raw emphasis fills it sits near 1.2.
-        let comment = Color::Rgb(0x56, 0x5f, 0x89);
-        for &(name, _) in NAMED {
-            let p = resolve(Some(name)).palette;
-            let target = contrast(comment, p.base).min(MIN_FILL_CONTRAST);
-            for fill in [p.emph_del_bg, p.emph_ins_bg] {
-                let lifted = legible(comment, fill, p.base, p.text);
-                assert!(
-                    contrast(lifted, fill) >= target,
-                    "{name}: {fill:?} still costs legibility"
-                );
-            }
-        }
+    fn a_light_theme_steps_its_surfaces_darker() {
+        let p = resolve(Some("catppuccin-latte")).palette;
+        let lum = |c| contrast(c, Color::Rgb(0, 0, 0));
+        assert!(lum(p.fill(Fill::Bar)) < lum(p.fill(Fill::Base)), "the bar is darker than base");
+        assert!(lum(p.fill(Fill::Cursor)) < lum(p.fill(Fill::Bar)), "the ramp keeps darkening");
     }
 
     #[test]
     fn a_color_already_legible_on_the_fill_is_untouched() {
         let p = resolve(Some("catppuccin")).palette;
-        assert_eq!(legible(p.text, p.emph_ins_bg, p.base, p.text), p.text);
+        let bright = Color::Rgb(0xf0, 0xf0, 0xf0);
+        assert_eq!(p.legible(bright, Fill::AddedEmph), bright);
+    }
+
+    /// A text tier resolved on the background resolves as that tier on a fill: rendered
+    /// markdown's muted and secondary text and its rules keep their order on the cursor row.
+    #[test]
+    fn a_text_tier_resolves_as_its_tier_on_a_fill() {
+        for name in NAMES {
+            let p = resolve(Some(name)).palette;
+            for ink in [Ink::Text, Ink::TextSecondary, Ink::TextMuted, Ink::Border] {
+                let on_base = p.ink(ink, Fill::Base);
+                assert_eq!(p.legible(on_base, Fill::Cursor), p.ink(ink, Fill::Cursor), "{name}");
+            }
+        }
     }
 
     #[test]
@@ -517,88 +317,170 @@ mod tests {
         let (comment, keyword) = (Color::Rgb(0x56, 0x5f, 0x89), Color::Rgb(0x9d, 0x7c, 0xd8));
         for name in ["tokyo-night-day", "solarized", "tokyo-night"] {
             let p = resolve(Some(name)).palette;
-            for fill in [p.emph_del_bg, p.emph_ins_bg] {
-                let (a, b) = (
-                    legible(comment, fill, p.base, p.text),
-                    legible(keyword, fill, p.base, p.text),
-                );
-                assert_ne!(a, b, "{name}: two syntax colors merged on {fill:?}");
-                assert_ne!(a, p.text, "{name}: the comment lost its hue on {fill:?}");
+            for on in [Fill::RemovedEmph, Fill::AddedEmph, Fill::Cursor] {
+                let (a, b) = (p.legible(comment, on), p.legible(keyword, on));
+                assert_ne!(a, b, "{name}: two syntax colors merged on {on:?}");
+                assert_ne!(a, p.ink(Ink::Text, on), "{name}: the comment lost its hue on {on:?}");
+            }
+        }
+    }
+
+    /// Each theme's accent, comment and merged colors on the background, lifted to 3:1; where two
+    /// read alike, the later takes the theme's next hue.
+    #[test]
+    fn every_theme_paints_its_accent_comment_and_merged() {
+        let painted: [(&str, u32, u32, u32); 20] = [
+            ("catppuccin", 0x89b4fa, 0xfab387, 0xcba6f7),
+            ("catppuccin-frappe", 0x8caaee, 0xef9f76, 0xca9ee6),
+            ("catppuccin-macchiato", 0x8aadf4, 0xf5a97f, 0xc6a0f6),
+            ("catppuccin-latte", 0x1e66f5, 0xee5c00, 0x8839ef),
+            ("tokyo-night", 0x7aa2f7, 0xff9e64, 0xbb9af7),
+            ("tokyo-night-day", 0x2e7de9, 0xb15c00, 0x9854f1),
+            ("dracula", 0xbd93f9, 0xffb86c, 0x8be9fd),
+            ("nord", 0x88c0d0, 0x81a1c1, 0xb48ead),
+            ("gruvbox", 0xd79921, 0xfe8019, 0xd3869b),
+            ("gruvbox-light", 0x076678, 0xaf3a03, 0x8f3f71),
+            ("one-dark", 0x61afef, 0xd19a66, 0xc678dd),
+            ("one-light", 0x4078f2, 0xa626a4, 0x986801),
+            ("solarized", 0x268bd2, 0xcb4b16, 0x6c71c4),
+            ("solarized-light", 0x268bd2, 0xcb4b16, 0x6c71c4),
+            ("monokai", 0x66d9ef, 0xfd971f, 0xae81ff),
+            ("rose-pine", 0xc4a7e7, 0xebbcba, 0x31748f),
+            ("rose-pine-dawn", 0x907aa9, 0x286983, 0xca7773),
+            ("ayu", 0x59c2ff, 0xff8f40, 0xd2a6ff),
+            ("everforest", 0x7fbbb3, 0xe69875, 0xd699b6),
+            ("github-light", 0x0969da, 0xbc4c00, 0x8250df),
+        ];
+        assert_eq!(painted.map(|row| row.0), NAMES, "every theme, in catalog order");
+        for (name, accent, comment, merged) in painted {
+            let p = resolve(Some(name)).palette;
+            let paints = |ink| p.mark(ink, Fill::Base);
+            assert_eq!(paints(Ink::Accent), rgb(accent), "{name} accent");
+            assert_eq!(paints(Ink::Comment), rgb(comment), "{name} comment");
+            assert_eq!(paints(Ink::Merged), rgb(merged), "{name} merged");
+        }
+    }
+
+    /// The color guarantees, measured on every theme, role and fill. Collects every failure
+    /// before asserting, so one run shows the whole picture.
+    #[test]
+    fn every_role_reads_on_every_fill() {
+        let mut failures = Vec::new();
+        for name in NAMES {
+            let theme = resolve(Some(name));
+            let p = theme.palette;
+            let base = p.fill(Fill::Base);
+            // The theme's real syntax colors, from a sample through its own syntax theme.
+            let syntax: Vec<Color> = crate::highlight::Highlighter::new(theme.syntax)
+                .highlight(SAMPLE, Some("rs"))
+                .into_iter()
+                .flatten()
+                .map(|span| Color::Rgb(span.color.0, span.color.1, span.color.2))
+                .collect();
+            for on in FILLS {
+                let bg = p.fill(on);
+                // A match and the caret repaint their text in `text`, so no syntax color sits
+                // on them, and only `text` paints there.
+                let solid = matches!(on, Fill::Highlight | Fill::Caret);
+                // Syntax colors keep their plain-background legibility on every fill.
+                for &c in syntax.iter().filter(|_| !solid) {
+                    let want = contrast(c, base).min(TEXT_FLOOR) - 0.05;
+                    let got = contrast(p.legible(c, on), bg);
+                    if got < want {
+                        failures
+                            .push(format!("{name}: syntax {c:?} on {on:?} {got:.2} < {want:.2}"));
+                    }
+                }
+                // Text clears its floor, muted text and every glyph theirs.
+                for ink in INKS {
+                    let floor = match ink {
+                        Ink::TextMuted | Ink::Border => MARK_FLOOR,
+                        _ => TEXT_FLOOR,
+                    };
+                    let c = contrast(p.ink(ink, on), bg);
+                    if c < floor - 0.005 {
+                        failures.push(format!("{name}: {ink:?} text on {on:?} {c:.2} < {floor}"));
+                    }
+                    let m = contrast(p.mark(ink, on), bg);
+                    if m < MARK_FLOOR - 0.005 {
+                        failures.push(format!("{name}: {ink:?} mark on {on:?} {m:.2} < 3"));
+                    }
+                }
+                // The text tiers keep their order and a visible step.
+                let tier = |ink| contrast(p.ink(ink, on), bg);
+                let (t, s, m) = (tier(Ink::Text), tier(Ink::TextSecondary), tier(Ink::TextMuted));
+                let ordered = t >= s * TIER_STEP - 0.01 && s >= m * TIER_STEP - 0.01;
+                if !solid && !ordered {
+                    failures.push(format!("{name}: tiers on {on:?} {t:.2} / {s:.2} / {m:.2}"));
+                }
+            }
+            // Every fill reads as a layer over every fill in a lower layer.
+            for (depth, layer) in LAYERS.iter().enumerate() {
+                for &top in *layer {
+                    for &under in LAYERS[..depth].iter().flat_map(|l| l.iter()) {
+                        let d = oklab_distance(p.fill(top), p.fill(under));
+                        if d < FILL_SEP - 0.0005 {
+                            failures.push(format!("{name}: {top:?} over {under:?} ΔE {d:.3}"));
+                        }
+                    }
+                }
+            }
+            // Inks that appear side by side read as different.
+            let beside: &[(Ink, &[Ink])] = &[
+                (
+                    Ink::Accent,
+                    &[Ink::Added, Ink::Removed, Ink::Modified, Ink::Comment, Ink::Merged],
+                ),
+                (Ink::Comment, &[Ink::Added, Ink::Removed, Ink::Modified, Ink::Merged]),
+            ];
+            for &(a, others) in beside {
+                for &b in others {
+                    let d = oklab_distance(p.ink(a, Fill::Base), p.ink(b, Fill::Base));
+                    if d < INK_SEP - 0.0005 {
+                        failures.push(format!("{name}: {a:?} beside {b:?} ΔE {d:.3}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    /// A Rust sample with comments, strings, numbers, keywords and calls: most of a syntax
+    /// theme's colors.
+    const SAMPLE: &str = "// Totals one order.\nfn total(items: &[Item]) -> u64 {\n    let tax = 0.2; /* rate */\n    items.iter().map(|i| i.price * 2).sum::<u64>() + \"x\".len() as u64\n}\n#[derive(Debug)]\npub struct Item { pub price: u64 }\n";
+
+    /// A match is a solid block of the theme's yellow and the caret one of its accent, each
+    /// found at a glance; text on them reads in every theme.
+    #[test]
+    fn a_match_and_the_caret_are_solid_blocks_text_reads_on() {
+        for name in NAMES {
+            let p = resolve(Some(name)).palette;
+            let (_, primitives, _) = entry(name).unwrap();
+            assert_eq!(p.fill(Fill::Highlight), primitives.yellow, "{name}: the match is yellow");
+            assert_eq!(p.fill(Fill::Caret), p.mark(Ink::Accent, Fill::Base), "{name}: caret");
+            for on in [Fill::Highlight, Fill::Caret] {
+                let c = contrast(p.ink(Ink::Text, on), p.fill(on));
+                assert!(c >= TEXT_FLOOR, "{name}: text on {on:?} {c:.2} < {TEXT_FLOOR}");
             }
         }
     }
 
     #[test]
-    fn light_derivation_keeps_diff_fills_legible() {
-        // Exercise the shipped catppuccin-latte anchors, so a real retune that breaks the
-        // contrast floor or the surface ramp is caught here.
-        let anchors = CATPPUCCIN_LATTE;
-        let p: Palette = derive(anchors, Appearance::Light);
-        // Text stays readable on every derived fill, on a light base.
-        for fill in [p.del_bg, p.ins_bg, p.emph_del_bg, p.emph_ins_bg] {
-            assert!(
-                contrast(p.text, fill) >= MIN_FILL_CONTRAST,
-                "fill {fill:?} drops below the legibility floor",
-            );
-        }
-        // A light theme steps its surfaces darker than the base, deepening along the ramp, so
-        // the fills read against the light canvas.
-        let base_lum = super::luminance(anchors.base);
-        assert!(super::luminance(p.surface0) < base_lum, "surface0 is darker than the base");
-        assert!(
-            super::luminance(p.surface2) < super::luminance(p.surface0),
-            "the surface ramp keeps darkening",
-        );
-    }
-
-    /// Every named theme and its appearance (`true` = light).
-    const NAMED: &[(&str, bool)] = &[
-        ("catppuccin", false),
-        ("catppuccin-latte", true),
-        ("dracula", false),
-        ("nord", false),
-        ("gruvbox", false),
-        ("gruvbox-light", true),
-        ("one-dark", false),
-        ("one-light", true),
-        ("solarized", false),
-        ("solarized-light", true),
-        ("catppuccin-frappe", false),
-        ("catppuccin-macchiato", false),
-        ("github-light", true),
-        ("monokai", false),
-        ("tokyo-night", false),
-        ("tokyo-night-day", true),
-        ("rose-pine", false),
-        ("rose-pine-dawn", true),
-    ];
-
-    #[test]
     fn every_named_theme_resolves_to_itself() {
-        for &(name, _) in NAMED {
+        for name in NAMES {
             assert_eq!(resolve(Some(name)).name, name, "{name} should resolve to its own palette");
         }
     }
 
     #[test]
-    fn every_theme_keeps_diff_fills_legible() {
-        for &(name, _) in NAMED {
-            let p = resolve(Some(name)).palette;
-            for fill in [p.del_bg, p.ins_bg, p.emph_del_bg, p.emph_ins_bg, p.sel_bg] {
-                assert!(
-                    contrast(p.text, fill) >= MIN_FILL_CONTRAST,
-                    "{name}: fill {fill:?} drops below the legibility floor",
-                );
-            }
-        }
-    }
-
-    #[test]
     fn appearance_orients_text_against_surface() {
-        for &(name, light) in NAMED {
+        for name in NAMES {
             let p = resolve(Some(name)).palette;
+            let light = entry(name).unwrap().1.cast == Cast::Light;
             // Light theme: dark text on a lighter surface. Dark theme: the reverse.
-            let text_darker = super::luminance(p.text) < super::luminance(p.surface0);
+            let dark = Color::Rgb(0, 0, 0);
+            let (text, bar) = (p.ink(Ink::Text, Fill::Base), p.fill(Fill::Bar));
+            let text_darker = contrast(text, dark) < contrast(bar, dark);
             assert_eq!(text_darker, light, "{name}: text/surface contrast points the wrong way");
         }
     }

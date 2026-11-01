@@ -1,9 +1,4 @@
-//! Optional event log for live debugging.
-//!
-//! When `$HERDR_REVIEW_LOG` names a writable file, the binary appends one
-//! timestamped line per input event, refresh, comment change, and export — enough
-//! to reconstruct a session. Unset is the default and makes every call site a
-//! no-op (the `logln!` macro skips formatting), so this is never product behavior.
+//! Debug log: one timestamped line per event to `$HERDR_REVIEW_LOG`; a no-op when unset.
 
 use std::fs::OpenOptions;
 use std::io::Write;

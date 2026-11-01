@@ -1,7 +1,4 @@
-//! In-memory review model: scopes, changed files, and comments.
-//!
-//! Comments live only for the session and are
-//! removed by export or delete — never by a refresh.
+//! The review model: scopes, changed files, and the session's comments, never lost to a refresh.
 
 /// Which set of changes the Changes view shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,8 +20,7 @@ impl Scope {
         }
     }
 
-    /// The scope's name in the specs and in config values (`default_scope`): kebab-case,
-    /// unlike the header chip's spaced `label`.
+    /// The kebab-case name config values use (`default_scope`).
     pub fn name(self) -> &'static str {
         match self {
             Scope::Uncommitted => "uncommitted",
@@ -34,8 +30,7 @@ impl Scope {
         }
     }
 
-    /// Cycle to the next scope, for the header chip click: uncommitted → branch → last turn →
-    /// commits.
+    /// The next scope, for a click on the header chip.
     #[must_use]
     pub fn cycle(self) -> Self {
         match self {
@@ -47,8 +42,7 @@ impl Scope {
     }
 }
 
-/// The `commits` scope's pick: a contiguous run from `oldest` to `newest`, both full commit
-/// ids, equal for a run of one.
+/// The `commits` pick: the run `oldest..=newest`, full ids, equal for a run of one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CommitPick {
     pub oldest: String,
@@ -65,9 +59,7 @@ impl CommitPick {
     }
 }
 
-/// Where a comment's diff was read: the worktree, or the picked run it came from. A diff
-/// comment renders only while the active scope reads the same diff, both sides: a run and
-/// its newest commit alone share a new side but not an old one.
+/// Where a comment's diff was read; it renders only while the scope reads that same diff.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Rev {
     Worktree,
@@ -81,6 +73,7 @@ pub enum ChangeKind {
     Modified,
     Deleted,
     Renamed,
+    Copied,
     Untracked,
 }
 
@@ -91,6 +84,7 @@ impl ChangeKind {
             ChangeKind::Modified => 'M',
             ChangeKind::Deleted => 'D',
             ChangeKind::Renamed => 'R',
+            ChangeKind::Copied => 'C',
             ChangeKind::Untracked => '?',
         }
     }
@@ -103,13 +97,22 @@ pub struct ChangedFile {
     pub kind: ChangeKind,
     pub additions: u32,
     pub deletions: u32,
-    /// The old path of a renamed file; `None` for every other kind. Its old content lives
-    /// at this path, so a rename diffs real content instead of reading as all-insertion.
+    /// The source path of a renamed or copied file, whose old content lives there.
     pub previous_path: Option<String>,
-    /// Git's own no-text-diff verdict for this change: binary content, or a path whose
-    /// `diff` attribute `.gitattributes` unsets. The pane reads it as the `binary` notice
-    /// without reading either side.
+    /// git's no-text-diff verdict, read as the binary notice.
     pub binary: bool,
+    /// The bytes git stores on the old side, 0 where there is none.
+    pub old_size: u64,
+    /// The bytes git stores on the new side, 0 where there is none; `None` for the worktree.
+    pub new_size: Option<u64>,
+}
+
+impl ChangedFile {
+    /// Whether `paths` cover this file or the source it was renamed from.
+    pub fn touched_by<'a>(&self, paths: impl IntoIterator<Item = &'a String> + Clone) -> bool {
+        crate::git::covered(paths.clone(), &self.path)
+            || self.previous_path.as_deref().is_some_and(|p| crate::git::covered(paths, p))
+    }
 }
 
 /// Which side of the diff a comment's lines live on.
@@ -129,8 +132,7 @@ pub struct Comment {
     /// Verbatim diff lines the comment anchors to, each keeping its `+`/`-`/space marker.
     pub lines: String,
     pub text: String,
-    /// True when anchored to a diff (the `Changes` tab); false for a File-view content comment
-    /// (the `All files` tab). Selects how staleness is judged.
+    /// A diff comment (`Changes`), else a content comment (`All files`).
     pub diff_anchored: bool,
     /// Where the new side was read.
     pub rev: Rev,
@@ -198,10 +200,12 @@ impl Comment {
     }
 }
 
-/// The in-memory comment list for one worktree review session.
+/// The session's comments, each with an id never reused, so a reference never lands on another.
 #[derive(Default, Debug)]
 pub struct CommentStore {
     items: Vec<Comment>,
+    ids: Vec<u64>,
+    next_id: u64,
 }
 
 impl CommentStore {
@@ -228,7 +232,19 @@ impl CommentStore {
     /// Append a comment; returns its index.
     pub fn add(&mut self, comment: Comment) -> usize {
         self.items.push(comment);
+        self.ids.push(self.next_id);
+        self.next_id += 1;
         self.items.len() - 1
+    }
+
+    /// The id of the comment at `index`.
+    pub fn id(&self, index: usize) -> Option<u64> {
+        self.ids.get(index).copied()
+    }
+
+    /// The index of the comment with id `id`, while the store holds it.
+    pub fn index_of(&self, id: u64) -> Option<usize> {
+        self.ids.iter().position(|&i| i == id)
     }
 
     /// Replace the text of the comment at `index`. Returns `false` if out of range.
@@ -243,11 +259,17 @@ impl CommentStore {
 
     /// Remove and return the comment at `index` (delete, or consume one on export).
     pub fn take(&mut self, index: usize) -> Option<Comment> {
-        if index < self.items.len() { Some(self.items.remove(index)) } else { None }
+        if index < self.items.len() {
+            self.ids.remove(index);
+            Some(self.items.remove(index))
+        } else {
+            None
+        }
     }
 
     /// Remove and return every comment (consume-all on a successful export).
     pub fn take_all(&mut self) -> Vec<Comment> {
+        self.ids.clear();
         std::mem::take(&mut self.items)
     }
 }
@@ -336,5 +358,21 @@ mod tests {
         assert_eq!(rest.len(), 1);
         assert!(s.is_empty());
         assert!(s.take(0).is_none());
+    }
+
+    #[test]
+    fn ids_are_never_reused_and_survive_an_edit() {
+        let mut s = CommentStore::new();
+        s.add(comment("a.rs", 1, 1, "one"));
+        let two = s.add(comment("a.rs", 2, 2, "two"));
+        let id = s.id(two).unwrap();
+        s.take(0);
+        assert_eq!(s.index_of(id), Some(0), "the list shifted, the id followed");
+        s.edit(0, "edited".into());
+        assert_eq!(s.id(0), Some(id));
+        s.take_all();
+        let three = s.add(comment("a.rs", 3, 3, "three"));
+        assert_ne!(s.id(three), Some(id), "a fresh comment never takes an old id");
+        assert_eq!(s.index_of(id), None);
     }
 }

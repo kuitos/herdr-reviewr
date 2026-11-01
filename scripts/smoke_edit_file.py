@@ -24,9 +24,8 @@ import termios
 import time
 
 ROWS, COLS = 40, 120
-# Every session reads a config dir. Left unset, reviewr falls back to the real installed one
-# and the suite would run against whatever the machine's own `editor` key says — opening the
-# reviewer's actual editor. `main` points this at an empty directory before any session starts.
+# An empty config dir `main` sets before any session, so the machine's own `editor` key never
+# opens the reviewer's real editor.
 NO_CONFIG = None
 ALT_ENTER = b"\x1b[?1049h"
 ALT_LEAVE = b"\x1b[?1049l"
@@ -96,7 +95,7 @@ def make_editor(bindir, argv_log, name, holds=0):
 
 
 class Session:
-    def __init__(self, binary, repo, editor, visual=None, config_dir=None, poll=600000):
+    def __init__(self, binary, repo, editor, visual=None, config_dir=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
         env = {**os.environ, "TERM": "xterm-256color"}
@@ -106,10 +105,14 @@ class Session:
             env["EDITOR"] = editor
         if visual:
             env["VISUAL"] = visual
+        # git's `core.editor` is the last source, so the machine's own global value would
+        # otherwise answer every session the variables leave unset.
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
         # Never the machine's own: an empty directory is the missing-file default.
         env["HERDR_PLUGIN_CONFIG_DIR"] = config_dir or NO_CONFIG
         self.proc = subprocess.Popen(
-            [binary, repo, "--poll", str(poll)],
+            [binary, repo],
             stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
         )
         os.close(slave)
@@ -237,9 +240,8 @@ def main():
             body = f.read()
         check("the editor's write lands in the worktree", EDITED_LINE.decode() in body)
 
-        # The return refreshes the changeset itself. This session polls every 600s, so nothing
-        # ambient can paint the new line: only `run_editor`'s own request puts it on screen.
-        check("the edit is on screen without waiting for a poll",
+        # The return refreshes the changeset itself, before any watcher batch could paint the line.
+        check("the edit is on screen without waiting for the watcher",
               EDITED_LINE in plain(after),
               "the diff still shows the pre-edit file after the editor returned")
 
@@ -270,9 +272,8 @@ def main():
 
         check("the status names the edited file", b"edited" in plain(after))
 
-        # `q` is the first key sent after the pane comes back, so this is also what proves the
-        # return does not swallow one. Reading output instead would not: the status expires on
-        # its own clock and repaints regardless of whether the press was seen.
+        # `q` is the first key after the pane comes back, so quitting proves the return swallowed
+        # none; the status line can't, since it repaints on its own clock.
         s.press("q")
         try:
             quit_code = s.proc.wait(timeout=10)
@@ -282,16 +283,15 @@ def main():
               f"exit={quit_code}, and None means the pane never saw the key")
         s.close()
 
-        # A window editor takes a different dialect and holds the file the way a reviewer does,
-        # so the checks below run against a pane with an editor still open. A real poll, since
-        # the poll is what shows the write.
+        # A window editor holds the file open as a reviewer's does, so the checks below run with
+        # it still open: the watcher is what shows the write.
         gui_log = os.path.join(home, "argv-gui.txt")
         gui = make_editor(bindir, gui_log, "code", holds=12)
         # Its own repository, so the earlier session's write is not already on screen.
         gui_root = os.path.join(home, "gui-repo")
         os.makedirs(gui_root)
         make_repo(gui_root)
-        s = Session(binary, gui_root, gui, poll=1000)
+        s = Session(binary, gui_root, gui)
         s.drain()
         gui_mark = len(s.seen)
         s.press_bounded("e", 2.0)
@@ -312,24 +312,23 @@ def main():
         check("so its own output never reaches the screen",
               b"FAKE-EDITOR-IS-ON-SCREEN" not in gui_after)
         check("the pane says it opened the file", b"opened" in gui_after)
-        # `tab` moves focus to the diff, which rewrites the footer's primary action — a change
-        # only the key can cause, unlike the ambient repaints this session's 1s poll produces.
+        # `tab` moves focus to the diff, which rewrites the footer's primary action: a change only
+        # the key can cause.
         check("the pane answers keys while the editor holds the file",
               b"comment" in plain(s.press_bounded("\t", 1.5)))
         # Nothing is watching the editor, so the pane rests: no wake of its own, no redraw.
         before = s.cpu_seconds()
         s.drain(quiet=0.3, timeout=2.0)
         burned = s.cpu_seconds() - before
-        # `ps -o time=` reports hundredths on macOS and whole seconds on Linux, so the bound is
-        # exact here and degrades to "did not burn a core" there. Either resolution catches the
-        # regression it exists for: a loop asking to wake at a deadline already in the past.
+        # `ps -o time=` is exact on macOS and whole seconds on Linux; either catches a loop waking
+        # at a deadline already past.
         check("and rests while it waits", burned < 0.2, f"burned {burned:.2f}s of cpu in 2s")
-        # Nothing waits for the editor to close: the poll shows the write while the file is
+        # Nothing waits for the editor to close: the watcher shows the write while the file is
         # still out, with no keypress from the reviewer.
         opened_at = time.perf_counter()
         while EDITED_LINE not in plain(s.seen[gui_mark:]) and time.perf_counter() - opened_at < 8:
             s.drain(quiet=0.3, timeout=1.0)
-        check("the poll shows the write with the file still out",
+        check("the watcher shows the write with the file still out",
               EDITED_LINE in plain(s.seen[gui_mark:]))
         # A file still out opens again rather than being refused: the reviewer has moved on to
         # another line and wants the editor to follow.
@@ -376,6 +375,19 @@ def main():
         s.press("q")
         s.close()
 
+        # With neither variable set, git's `core.editor` opens. The read happens in the binary
+        # against the reviewed repo, which only a live session exercises.
+        git_log = os.path.join(home, "argv-git.txt")
+        from_git = make_editor(bindir, git_log, "hx")
+        sh(root, "git", "config", "core.editor", from_git)
+        s = Session(binary, root, None)
+        s.drain()
+        s.press("e")
+        check("git's core.editor opens when no variable is set", os.path.exists(git_log))
+        s.press("q")
+        s.close()
+        sh(root, "git", "config", "--unset", "core.editor")
+
         # A value that survives config validation but names no program is a different cause
         # from an unset editor, and must not be reported as one.
         bare_dir = os.path.join(home, "cfg-bare")
@@ -397,7 +409,7 @@ def main():
         s.drain()
         mark = len(s.seen)
         s.press("e")
-        check("a window editor that is not there says so", b"no editor at" in plain(s.seen[mark:]))
+        check("a window editor that is not there says so", b"editor not found" in plain(s.seen[mark:]))
         check("and the pane is never handed over for it", ALT_LEAVE not in s.seen[mark:])
         s.press("q")
         s.close()
@@ -427,7 +439,7 @@ def main():
         # next keypress. The loop draws only after an event arrives, so the run has to repaint.
         for label, ed, needle in [
             ("no editor set", None, b"set `editor`"),
-            ("a missing editor binary", "/nonexistent/nope", b"no editor at"),
+            ("a missing editor binary", "/nonexistent/nope", b"editor not found"),
             ("an editor that exits nonzero", "/usr/bin/false", b"editor exited"),
         ]:
             s = Session(binary, root, ed)

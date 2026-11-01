@@ -15,8 +15,8 @@ just run           # run reviewr against this repo
 cargo run -- ~/some/repo   # or against any repo
 ```
 
-`just ci` runs exactly what CI runs: format check, clippy with warnings as errors, tests, and a
-release build. Green there means green in CI.
+`just ci` runs what CI's unix job runs: format check, clippy with warnings as errors, tests, and a
+release build. CI also runs the Windows build, tests, and plugin install, which run there only.
 
 `just smoke-edit` is the one check CI cannot run. It drives a real release binary through a pty
 to test the `e` key: unit tests stop at the editor's argv, and everything past it is terminal
@@ -29,9 +29,11 @@ plugin and `just qa-restore` brings the release back. The details and the sharp 
 
 ## How this repo works
 
-**Specs are the contract.** New behavior is a change spec under
-`docs/specs/YYYY-MM-DD-<slug>/spec.md`, then a plan and tickets beside it. A behavior change
-lands in that spec and the code together, in the same PR.
+**Commits carry the decisions.** The repo keeps no spec tree. A behavior change explains its
+why in the commit message and the changelog.
+
+**Comments are one line.** Two lines need a serious reason. Three mean the code should say it
+instead.
 
 **The changelog is written as you go.** User-visible changes add a bullet under `## [Unreleased]`
 in `CHANGELOG.md`. That text becomes the release notes verbatim, so write it for the person
@@ -52,8 +54,9 @@ component calls.
 ## Pull requests
 
 - Keep one PR to one concern.
-- `just ci` green, change spec updated with the behavior, changelog bullet added.
-- Tests live beside the code (unit) and in `tests/` (integration, against real git repos).
+- `just ci` green, changelog bullet added.
+- Tests live beside the code (unit) and in `tests/` (integration, against real git repos), where
+  `comment_shape.rs` also holds every comment in code, scripts, and configs to two lines.
   Test names read as sentences: `a_tab_switch_paints_the_stashed_frame_and_defers_its_reload`.
 
 ## Releasing

@@ -1,9 +1,4 @@
-//! Component attribution for the perceived-latency work: times the individual blocking
-//! calls (git spawns, diff builds, highlights) that make up a switch, against a real repo.
-//! `scripts/bench_tui.py` is the acceptance instrument — it measures keypress to painted
-//! frame in the real binary. Reach for this tool to find out *where* a slow number in that
-//! harness comes from.
-//!
+//! Times the blocking calls behind a slow `scripts/bench_tui.py` number, against a real repo.
 //! Usage: `cargo run --release --example bench_latency -- <repo-path> [label]`
 
 use std::path::PathBuf;
@@ -12,7 +7,6 @@ use std::time::Instant;
 use herdr_reviewr::diff::DiffCache;
 use herdr_reviewr::git;
 use herdr_reviewr::highlight::Highlighter;
-use herdr_reviewr::model::Scope;
 use herdr_reviewr::theme;
 
 fn ms(f: impl FnOnce()) -> f64 {
@@ -42,19 +36,20 @@ fn main() {
     println!("== {label} ==");
 
     // --- Components of reload() -------------------------------------------------
-    let changed = git::changed_files(&repo, Scope::Uncommitted, None).unwrap();
+    let changed = git::changed_from(&repo, &git::diff_base(git::head_oid(&repo))).unwrap();
     row(
-        "changed_files (uncommitted)",
+        "changed_from (uncommitted)",
         sample(5, || {
-            git::changed_files(&repo, Scope::Uncommitted, None).unwrap();
+            git::changed_from(&repo, &git::diff_base(git::head_oid(&repo))).unwrap();
         }),
     );
     row(
-        "changed_files (branch, incl. resolve)",
+        "changed_from (branch, incl. resolve)",
         sample(5, || {
             let base = git::resolve_base(&repo, None).ok().and_then(|r| r.status.winner);
-            git::changed_files(&repo, Scope::Branch, base.as_ref().map(git::ResolvedBase::oid))
-                .unwrap();
+            if let Some(base) = base.and_then(|b| git::merge_base(&repo, b.oid())) {
+                git::changed_from(&repo, &base).unwrap();
+            }
         }),
     );
     let all = git::all_files(&repo).unwrap();
@@ -71,10 +66,7 @@ fn main() {
         }),
     );
 
-    // --- File opens -------------------------------------------------------------
-    // Pick representative text files by on-disk size: the median, and the largest
-    // comfortably under the 2 MB diff byte budget so the open exercises a full
-    // highlight instead of the too-large notice.
+    // File opens: the median text file, and the largest still under the diff budget.
     let mut sized: Vec<(u64, String)> = all
         .iter()
         .filter(|e| !e.is_dir && !e.ignored)
@@ -122,46 +114,50 @@ fn main() {
         );
     }
 
-    // Changes tab: set_diff = git show HEAD:path + fs read + two-side highlight + diff.
-    if let Some(cf) = changed.first() {
+    // Changes tab: set_diff = one `git diff` for both sides + two-side highlight + diff.
+    // An untracked file reads raw, never through `git diff`.
+    if let Some(cf) = changed.iter().find(|f| f.kind != herdr_reviewr::model::ChangeKind::Untracked)
+    {
         let path = cf.path.clone();
+        let base = git::diff_base(git::head_oid(&repo));
+        let source = cf.previous_path.clone();
+        let sides = || match git::diff_sides(&repo, &base, None, &path, source.as_deref()) {
+            Ok(git::DiffSides::Text { old, new }) => (old, new),
+            _ => (String::new(), String::new()),
+        };
         row(
             &format!("diff open, Changes COLD ({path})"),
             sample(3, || {
                 let mut cache = DiffCache::new();
-                let old = git::file_content(&repo, "HEAD", &path);
-                let new = std::fs::read_to_string(repo.join(&path)).unwrap_or_default();
-                cache.get(path.clone(), None, &old, &new, &hl);
+                let (old, new) = sides();
+                cache.get(path.clone(), source.clone(), &old, &new, &hl);
             }),
         );
         let mut warm = DiffCache::new();
-        let old0 = git::file_content(&repo, "HEAD", &path);
-        let new0 = std::fs::read_to_string(repo.join(&path)).unwrap_or_default();
-        warm.get(path.clone(), None, &old0, &new0, &hl);
+        let (old0, new0) = sides();
+        warm.get(path.clone(), source.clone(), &old0, &new0, &hl);
         row(
             "diff open, Changes WARM (same file re-poll)",
             sample(5, || {
-                let old = git::file_content(&repo, "HEAD", &path);
-                let new = std::fs::read_to_string(repo.join(&path)).unwrap_or_default();
-                warm.get(path.clone(), None, &old, &new, &hl);
+                let (old, new) = sides();
+                warm.get(path.clone(), source.clone(), &old, &new, &hl);
             }),
         );
     } else {
-        // No uncommitted changes: still time the git-show side against the median file.
+        // No uncommitted changes: still time the sides read against the median file.
         row(
-            "diff open sides only (git show, clean repo)",
+            "diff open sides only (clean repo)",
             sample(5, || {
-                git::file_content(&repo, "HEAD", &median_file);
+                git::diff_sides(&repo, "HEAD", None, &median_file, None).unwrap();
             }),
         );
     }
 
-    // --- Composite: what one All-files reload costs ------------------------------
-    // (The Changes composite is the changed_files row above — one call, no reopen.)
+    // --- Composite: one All-files reload.
     row(
         "TAB SWITCH -> All files (reload, no reopen)",
         sample(3, || {
-            git::changed_files(&repo, Scope::Uncommitted, None).unwrap();
+            git::changed_from(&repo, &git::diff_base(git::head_oid(&repo))).unwrap();
             git::all_files(&repo).unwrap();
         }),
     );

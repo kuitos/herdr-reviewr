@@ -1,16 +1,14 @@
-//! The structured diff model: a file's changes as rows built from its old and new
-//! content, syntax-highlighted, ready to paint.
-//!
-//! This module is terminal-free — a `Span` carries an RGB
-//! color, and `src/ui.rs` maps it to a ratatui color.
+//! The diff model: a file's changes as highlighted rows, terminal-free.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
 use similar::{ChangeTag, TextDiff};
 
 use crate::highlight::Highlighter;
+use crate::model::Side;
+use crate::text::{line_body, lines};
 
 /// An 8-bit RGB color.
 pub type Rgb = (u8, u8, u8);
@@ -22,14 +20,61 @@ pub struct Span {
     pub color: Rgb,
 }
 
-/// A rendered diff row. Content rows (`Context`/`Deletion`/`Insertion`) are selectable
-/// for comments; a `Fold` is a collapsed run of context lines it owns.
+/// A diff row: a content row takes comments, a `Fold` owns the context lines it hides.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Row {
-    Context { old_no: u32, new_no: u32, spans: Vec<Span> },
-    Deletion { old_no: u32, spans: Vec<Span>, emphasis: Vec<CharRange> },
-    Insertion { new_no: u32, spans: Vec<Span>, emphasis: Vec<CharRange> },
-    Fold { lines: Vec<Row> },
+    Context {
+        old_no: u32,
+        new_no: u32,
+        spans: Vec<Span>,
+    },
+    /// `cr`: the line's kept CR changed, painted as a marker, never part of the text.
+    Deletion {
+        old_no: u32,
+        spans: Vec<Span>,
+        emphasis: Vec<CharRange>,
+        cr: bool,
+    },
+    Insertion {
+        new_no: u32,
+        spans: Vec<Span>,
+        emphasis: Vec<CharRange>,
+        cr: bool,
+    },
+    Fold {
+        lines: Vec<Row>,
+    },
+    /// One pre-wrapped line of a rendered markdown view; `src..=src_end` is its unit's source range.
+    Rendered {
+        src: u32,
+        src_end: u32,
+        text: String,
+        kind: RenderedKind,
+    },
+}
+
+/// What a rendered row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderedKind {
+    /// A block's line. `source` and `wrap` (`None` for the gap above) are its identity across
+    /// rebuilds; `hides` counts changed lines under a collapsed `<details>`.
+    Block { source: (u32, u32), wrap: Option<u32>, line: u32, bar: Option<Bar>, hides: Option<u32> },
+    /// A marker for `lines` changed lines no block shows; `gone` when a block was deleted whole.
+    Marker { kind: MarkerKind, lines: u32, gone: bool },
+}
+
+/// A changed block's bar: `Added` when it only gained lines, `Modified` otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Bar {
+    Added,
+    Modified,
+}
+
+/// A marker row's kind: a block deleted whole, or changed source that renders nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MarkerKind {
+    Removed,
+    Unrendered,
 }
 
 /// A `[start, end)` run of char indices within a line, for word-level emphasis.
@@ -39,14 +84,23 @@ impl Row {
     pub fn old_no(&self) -> Option<u32> {
         match self {
             Row::Context { old_no, .. } | Row::Deletion { old_no, .. } => Some(*old_no),
-            Row::Insertion { .. } | Row::Fold { .. } => None,
+            Row::Insertion { .. } | Row::Fold { .. } | Row::Rendered { .. } => None,
+        }
+    }
+
+    /// The line on `side`, if this row holds one.
+    pub fn no(&self, side: Side) -> Option<u32> {
+        match side {
+            Side::Old => self.old_no(),
+            Side::New => self.new_no(),
         }
     }
 
     pub fn new_no(&self) -> Option<u32> {
         match self {
             Row::Context { new_no, .. } | Row::Insertion { new_no, .. } => Some(*new_no),
-            Row::Deletion { .. } | Row::Fold { .. } => None,
+            // A rendered line is no source line: its unit names its range.
+            Row::Deletion { .. } | Row::Fold { .. } | Row::Rendered { .. } => None,
         }
     }
 
@@ -55,17 +109,21 @@ impl Row {
             Row::Context { spans, .. }
             | Row::Deletion { spans, .. }
             | Row::Insertion { spans, .. } => spans,
-            Row::Fold { .. } => &[],
+            Row::Rendered { .. } | Row::Fold { .. } => &[],
         }
     }
 
-    /// The char ranges within this line that differ from its paired counterpart; empty
-    /// on context, folds, and unpaired change lines.
+    /// The char ranges that differ from the paired line; empty when unpaired.
     pub fn emphasis(&self) -> &[CharRange] {
         match self {
             Row::Deletion { emphasis, .. } | Row::Insertion { emphasis, .. } => emphasis,
-            Row::Context { .. } | Row::Fold { .. } => &[],
+            Row::Context { .. } | Row::Fold { .. } | Row::Rendered { .. } => &[],
         }
+    }
+
+    /// Whether the paint ends this line in a CR marker: its ending changed.
+    pub fn cr_marker(&self) -> bool {
+        matches!(self, Row::Deletion { cr: true, .. } | Row::Insertion { cr: true, .. })
     }
 
     /// The diff marker for this row: `' '`, `'-'`, or `'+'`; `' '` for a fold.
@@ -73,7 +131,7 @@ impl Row {
         match self {
             Row::Deletion { .. } => '-',
             Row::Insertion { .. } => '+',
-            Row::Context { .. } | Row::Fold { .. } => ' ',
+            Row::Context { .. } | Row::Fold { .. } | Row::Rendered { .. } => ' ',
         }
     }
 
@@ -90,8 +148,7 @@ impl Row {
         }
     }
 
-    /// A fold's stable identity across rebuilds: the line number of its first hidden
-    /// line. `None` for any other row.
+    /// A fold's identity across rebuilds: its first hidden line's number.
     pub fn fold_anchor(&self) -> Option<u32> {
         match self {
             Row::Fold { lines } => lines.first().and_then(|r| r.new_no().or_else(|| r.old_no())),
@@ -101,7 +158,10 @@ impl Row {
 
     /// The line's plain text, joined from its spans.
     pub fn text(&self) -> String {
-        self.spans().iter().map(|s| s.text.as_str()).collect()
+        match self {
+            Row::Rendered { text, .. } => text.clone(),
+            _ => self.spans().iter().map(|s| s.text.as_str()).collect(),
+        }
     }
 
     /// The line as a marker-prefixed diff line, for the export snippet.
@@ -110,12 +170,25 @@ impl Row {
     }
 }
 
-/// Whether the file renders as rows, or a notice instead.
+/// A notice that stands in for a file's rows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileState {
-    Normal,
+pub enum Notice {
     Binary,
     TooLarge,
+    /// A side failed to read, through git or from disk; the next refresh tries again.
+    Unreadable,
+}
+
+impl Notice {
+    /// What the read pane says in the file's place.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Binary => "binary file · no line comments",
+            Self::TooLarge => "file too large to show",
+            Self::Unreadable => "couldn't read this file",
+        }
+    }
 }
 
 /// How the pane renders the model: the `Changes` diff, or the `All files` whole-file content.
@@ -133,19 +206,20 @@ pub struct FileDiff {
     pub path: String,
     /// The old path when this file was renamed, for the `old → new` header; `None` otherwise.
     pub previous_path: Option<String>,
-    pub state: FileState,
+    /// The notice shown in place of rows, `None` when the file renders.
+    pub notice: Option<Notice>,
     pub view: View,
     pub rows: Vec<Row>,
+    /// The `(old, new)` line numbers of each line edited in place.
+    pub pairs: Vec<(u32, u32)>,
 }
 
-/// A file beyond either budget renders as `too_large` rather than stalling the diff —
-/// the byte budget also catches a single huge line that the line budget misses.
-const MAX_LINES: usize = 50_000;
+/// The line budget; the byte budget below catches one huge line.
+pub(crate) const MAX_LINES: usize = 50_000;
 /// The byte budget. A file larger than this renders as a `too_large` notice.
-const MAX_BYTES: usize = 2_000_000;
+pub(crate) const MAX_BYTES: usize = 2_000_000;
 
-/// Whether a file of `len` bytes is over the size budget. `set_file_view` checks the on-disk
-/// size with this before reading, so an oversize blob never loads (`app.rs`).
+/// Whether a file of `len` bytes is over the size budget.
 #[must_use]
 pub fn over_byte_budget(len: usize) -> bool {
     len > MAX_BYTES
@@ -158,19 +232,43 @@ impl Default for FileDiff {
 }
 
 impl FileDiff {
-    /// An empty placeholder, for when no file is selected.
-    pub fn empty() -> Self {
-        Self {
-            path: String::new(),
-            previous_path: None,
-            state: FileState::Normal,
-            view: View::Diff,
-            rows: Vec::new(),
+    /// Whether a split view has two sides to show: a changed line, and lines on both sides.
+    #[must_use]
+    pub fn splits(&self) -> bool {
+        let (mut old, mut new, mut change) = (false, false, false);
+        // A fold holds context, lines on both sides, so its lines need no walk.
+        for row in &self.rows {
+            let (o, n) = match row {
+                Row::Deletion { .. } => (true, false),
+                Row::Insertion { .. } => (false, true),
+                Row::Context { .. } | Row::Fold { .. } => (true, true),
+                Row::Rendered { .. } => (false, false),
+            };
+            (old, new) = (old | o, new | n);
+            change |= o != n;
+            if old && new && change {
+                return true;
+            }
         }
+        false
     }
 
-    /// Build the model from `old` and `new` content, highlighting with `hl`. `previous_path`
-    /// is the rename source, surfaced in the header; `None` for every other change.
+    /// An empty placeholder, for when no file is selected.
+    pub fn empty() -> Self {
+        Self::rowless(String::new(), None, None, View::Diff)
+    }
+
+    /// A model with no rows: a notice, or the empty placeholder.
+    fn rowless(
+        path: String,
+        previous_path: Option<String>,
+        notice: Option<Notice>,
+        view: View,
+    ) -> Self {
+        Self { path, previous_path, notice, view, rows: Vec::new(), pairs: Vec::new() }
+    }
+
+    /// Build the diff of `old` to `new`; `previous_path` is a rename or copy source.
     pub fn build(
         path: String,
         previous_path: Option<String>,
@@ -179,29 +277,26 @@ impl FileDiff {
         hl: &Highlighter,
     ) -> Self {
         let language = language_of(&path);
-        let notice = |state| Self {
-            path: path.clone(),
-            previous_path: previous_path.clone(),
-            state,
-            view: View::Diff,
-            rows: Vec::new(),
-        };
+        let notice = |n| Self::rowless(path.clone(), previous_path.clone(), Some(n), View::Diff);
         if old.contains('\0') || new.contains('\0') {
-            return notice(FileState::Binary);
+            return notice(Notice::Binary);
         }
-        if over_byte_budget(old.len() + new.len())
-            || old.lines().count() + new.lines().count() > MAX_LINES
-        {
-            return notice(FileState::TooLarge);
+        if over_byte_budget(old.len() + new.len()) {
+            return notice(Notice::TooLarge);
+        }
+        // One split feeds both the diff and the highlighter, so row `i` paints line `i`.
+        let (old_lines, new_lines) = (lines(old), lines(new));
+        if old_lines.len() + new_lines.len() > MAX_LINES {
+            return notice(Notice::TooLarge);
         }
 
         let lang = language.as_deref();
-        let old_spans = hl.highlight(old, lang);
-        let new_spans = hl.highlight(new, lang);
+        let old_spans = hl.highlight_lines(&old_lines, lang);
+        let new_spans = hl.highlight_lines(&new_lines, lang);
         let line = |spans: &[Vec<Span>], i: usize| spans.get(i).cloned().unwrap_or_default();
 
         let mut rows = Vec::new();
-        for change in TextDiff::from_lines(old, new).iter_all_changes() {
+        for change in TextDiff::from_slices(&old_lines, &new_lines).iter_all_changes() {
             match change.tag() {
                 ChangeTag::Equal => {
                     let (oi, ni) = (change.old_index().unwrap(), change.new_index().unwrap());
@@ -217,6 +312,7 @@ impl FileDiff {
                         old_no: oi as u32 + 1,
                         spans: line(&old_spans, oi),
                         emphasis: Vec::new(),
+                        cr: false,
                     });
                 }
                 ChangeTag::Insert => {
@@ -225,70 +321,55 @@ impl FileDiff {
                         new_no: ni as u32 + 1,
                         spans: line(&new_spans, ni),
                         emphasis: Vec::new(),
+                        cr: false,
                     });
                 }
             }
         }
-        compute_emphasis(&mut rows);
+        // Pair on text alone, then mark endings, so an ending-only change pairs with its twin.
+        let paired = compute_emphasis(&mut rows);
+        mark_crs(&mut rows, &old_lines, &new_lines, &paired);
+        let mut pairs: Vec<(u32, u32)> =
+            paired.iter().filter_map(|&(d, i)| rows[d].old_no().zip(rows[i].new_no())).collect();
+        pairs.sort_unstable();
         Self {
             path,
             previous_path,
-            state: FileState::Normal,
+            notice: None,
             view: View::Diff,
             rows: collapse_context(&rows),
+            pairs,
         }
     }
 
-    /// Build the File view: the whole current `content` as `Context` rows, syntax-highlighted,
-    /// with no folds, change rows, or emphasis. Powers the `All files` tab.
-    /// Degrades to a `binary` or `too_large` notice on the same budgets as [`build`](Self::build).
+    /// Build the File view: all of `content` as `Context` rows, under the same budgets.
     fn build_file(path: String, content: &str, hl: &Highlighter) -> Self {
-        let notice = |state| Self {
-            path: path.clone(),
-            previous_path: None,
-            state,
-            view: View::File,
-            rows: Vec::new(),
-        };
+        let notice = |n| Self::rowless(path.clone(), None, Some(n), View::File);
         if content.contains('\0') {
-            return notice(FileState::Binary);
+            return notice(Notice::Binary);
         }
-        if over_byte_budget(content.len()) || content.lines().count() > MAX_LINES {
-            return notice(FileState::TooLarge);
+        if over_byte_budget(content.len()) {
+            return notice(Notice::TooLarge);
         }
-        let spans = hl.highlight(content, language_of(&path).as_deref());
-        let rows = content
-            .lines()
+        let lines = lines(content);
+        if lines.len() > MAX_LINES {
+            return notice(Notice::TooLarge);
+        }
+        let rows = hl
+            .highlight_lines(&lines, language_of(&path).as_deref())
+            .into_iter()
             .enumerate()
-            .map(|(i, _)| {
+            .map(|(i, spans)| {
                 let no = i as u32 + 1;
-                Row::Context {
-                    old_no: no,
-                    new_no: no,
-                    spans: spans.get(i).cloned().unwrap_or_default(),
-                }
+                Row::Context { old_no: no, new_no: no, spans }
             })
             .collect();
-        Self { path, previous_path: None, state: FileState::Normal, view: View::File, rows }
+        Self { rows, ..Self::rowless(path, None, None, View::File) }
     }
 
-    /// The Diff-view `binary` notice, for a change git already reported as having no text
-    /// diff. `set_diff` builds this rather than reading either side's blob, so a `-diff`
-    /// lockfile costs no `git show` at all.
-    pub fn binary_notice(path: String, previous_path: Option<String>) -> Self {
-        Self { path, previous_path, state: FileState::Binary, view: View::Diff, rows: Vec::new() }
-    }
-
-    /// The File-view `too_large` notice, for an over-budget file the caller declines to read.
-    /// `set_file_view` checks the on-disk size and builds this rather than reading the bytes.
-    pub fn too_large_notice(path: String) -> Self {
-        Self {
-            path,
-            previous_path: None,
-            state: FileState::TooLarge,
-            view: View::File,
-            rows: Vec::new(),
-        }
+    /// A notice for a file the caller declines, or failed, to read.
+    pub fn notice(path: String, previous_path: Option<String>, notice: Notice, view: View) -> Self {
+        Self::rowless(path, previous_path, Some(notice), view)
     }
 }
 
@@ -297,49 +378,100 @@ pub(crate) fn set_row_spans(row: &mut Row, next: Vec<Span>) {
         Row::Context { spans, .. } | Row::Deletion { spans, .. } | Row::Insertion { spans, .. } => {
             *spans = next;
         }
-        Row::Fold { .. } => {}
+        Row::Rendered { .. } | Row::Fold { .. } => {}
     }
 }
 
-/// Fill word-level `emphasis` on the related deletion/insertion lines of each change block
-/// (a run of deletions immediately followed by a run of insertions). Rather than pairing by
-/// position — which mis-pairs unrelated lines when a block rewrites several lines at once —
-/// each deletion greedily searches forward for its *homolog*: the first not-yet-claimed
-/// insertion similar enough to be the same line edited (see [`pair_homologs`], after
-/// git-delta's `infer_edits`). Lines with no homolog stay unemphasized, carrying only their
-/// red/green; emphasis then points at a real edit instead of flooding a wholesale rewrite.
-pub(crate) fn compute_emphasis(rows: &mut [Row]) {
+/// Mark the CR of each edited line whose ending changed: on its exact twin first, else its pair.
+fn mark_crs(rows: &mut [Row], old: &[&str], new: &[&str], pairs: &[(usize, usize)]) {
+    if !old.iter().chain(new).any(|line| line.contains('\r')) {
+        return;
+    }
+    let ends_cr = |lines: &[&str], no: u32| line_body(lines[no as usize - 1]).1;
+    for &(d, i) in pairs {
+        let (Some(o), Some(n)) = (rows[d].old_no(), rows[i].new_no()) else { continue };
+        let marked = match (ends_cr(old, o), ends_cr(new, n)) {
+            (true, false) => d,
+            (false, true) => i,
+            _ => continue,
+        };
+        if let Row::Deletion { cr, .. } | Row::Insertion { cr, .. } = &mut rows[marked] {
+            *cr = true;
+        }
+    }
+}
+
+/// Word emphasis on each change block's homolog pairs; returns the pairs' row indices.
+pub(crate) fn compute_emphasis(rows: &mut [Row]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for (dels, inss) in change_blocks(rows) {
+        pair_homologs(rows, dels, inss, &mut pairs);
+    }
+    pairs
+}
+
+/// Each change block's deletion and insertion index ranges, in order.
+pub(crate) fn change_blocks<R: std::borrow::Borrow<Row>>(
+    rows: &[R],
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let is = |i: usize, deletion: bool| match rows.get(i).map(std::borrow::Borrow::borrow) {
+        Some(Row::Deletion { .. }) => deletion,
+        Some(Row::Insertion { .. }) => !deletion,
+        _ => false,
+    };
+    let mut out = Vec::new();
     let mut i = 0;
     while i < rows.len() {
         let del_start = i;
-        while i < rows.len() && matches!(rows[i], Row::Deletion { .. }) {
+        while is(i, true) {
             i += 1;
         }
         let ins_start = i;
-        while i < rows.len() && matches!(rows[i], Row::Insertion { .. }) {
+        while is(i, false) {
             i += 1;
         }
-        pair_homologs(rows, del_start..ins_start, ins_start..i);
-        // No change block started here; step over the context/fold row.
         if del_start == i {
+            // No change block started here; step over the context/fold row.
             i += 1;
+        } else {
+            out.push((del_start..ins_start, ins_start..i));
         }
     }
+    out
 }
 
-/// Pair each deletion in `dels` with its homolog insertion in `inss` and set both lines'
-/// emphasis. Greedy forward scan: deletion `d` takes the first insertion at or after the
-/// last-claimed one whose similarity clears [`MIN_SIMILARITY`]; insertions skipped along the
-/// way are abandoned (they were inserts, not edits of `d`). A deletion with no qualifying
-/// insertion is left unpaired. Mirrors git-delta's homolog inference.
-fn pair_homologs(rows: &mut [Row], dels: std::ops::Range<usize>, inss: std::ops::Range<usize>) {
+/// Pair each deletion with its homolog insertion, exact twins first, and set both lines' emphasis.
+fn pair_homologs(
+    rows: &mut [Row],
+    dels: std::ops::Range<usize>,
+    inss: std::ops::Range<usize>,
+    pairs: &mut Vec<(usize, usize)>,
+) {
+    let old_texts: Vec<String> = dels.clone().map(|d| rows[d].text()).collect();
+    let new_texts: Vec<String> = inss.clone().map(|p| rows[p].text()).collect();
+    let mut claimed = vec![false; inss.len()];
+    let mut twinned = vec![false; dels.len()];
+    // Exact twins first, anywhere in the block: a line whose ending alone changed is that line.
+    let mut twins: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (j, text) in new_texts.iter().enumerate() {
+        twins.entry(text).or_default().push_back(j);
+    }
+    for (k, d) in dels.clone().enumerate() {
+        if let Some(j) = twins.get_mut(old_texts[k].as_str()).and_then(VecDeque::pop_front) {
+            claimed[j] = true;
+            twinned[k] = true;
+            pairs.push((d, inss.start + j));
+        }
+    }
+    // Then each remaining line's first similar unclaimed successor within a window, in order.
     let mut next_ins = inss.start;
-    for d in dels {
-        let old = rows[d].text();
-        let mut p = next_ins;
-        while p < inss.end {
-            let new = rows[p].text();
-            let (ratio, old_e, new_e) = word_emphasis(&old, &new);
+    for (k, d) in dels.enumerate() {
+        if twinned[k] {
+            continue;
+        }
+        let candidates = (next_ins..inss.end).filter(|&p| !claimed[p - inss.start]);
+        for p in candidates.take(SIMILAR_WINDOW) {
+            let (ratio, old_e, new_e) = word_emphasis(&old_texts[k], &new_texts[p - inss.start]);
             if ratio >= MIN_SIMILARITY {
                 if let Row::Deletion { emphasis, .. } = &mut rows[d] {
                     *emphasis = old_e;
@@ -347,28 +479,23 @@ fn pair_homologs(rows: &mut [Row], dels: std::ops::Range<usize>, inss: std::ops:
                 if let Row::Insertion { emphasis, .. } = &mut rows[p] {
                     *emphasis = new_e;
                 }
+                claimed[p - inss.start] = true;
+                pairs.push((d, p));
                 next_ins = p + 1;
                 break;
             }
-            p += 1;
         }
     }
 }
 
-/// Two lines below this similarity are taken to be different lines, not one line edited, so
-/// they are never paired for inline emphasis (see [`pair_homologs`]). git-delta's equivalent
-/// `max_line_distance` defaults to 0.6 *distance* — the complementary metric — but we sit
-/// stricter because over-highlighting a rewrite is worse than missing a marginal edit: a pair
-/// that only shares a syntactic skeleton (a reformat, or two different `let`s) scatters
-/// unhelpful fragments. Empirically marginal pairs land near ~0.6–0.65 and genuine edits near
-/// ~0.71–0.78, so the bar sits in the gap.
+/// How many unclaimed insertions a deletion tries, so a rewrite block costs linear, not square.
+const SIMILAR_WINDOW: usize = 64;
+
+/// Below this, two lines are different lines, not one edited. Stricter than git-delta: marginal
+/// pairs land near 0.6–0.65, real edits near 0.71–0.78.
 const MIN_SIMILARITY: f32 = 0.7;
 
-/// The word-level similarity of `(old, new)` and the char ranges that changed: the words
-/// present only in `old` (deletion emphasis) and only in `new` (insertion emphasis). The
-/// caller gates on the ratio (see [`pair_homologs`]); the ranges are meaningful only once it
-/// clears the bar. Adjacent changed words separated only by whitespace coalesce into one
-/// block (see [`coalesce_ws_gaps`]), so a changed phrase reads as a single span, not fragments.
+/// The word similarity of `old` and `new`, and the char ranges only each side has.
 fn word_emphasis(old: &str, new: &str) -> (f32, Vec<CharRange>, Vec<CharRange>) {
     let diff = TextDiff::from_words(old, new);
     let (mut old_ranges, mut new_ranges) = (Vec::new(), Vec::new());
@@ -395,10 +522,7 @@ fn word_emphasis(old: &str, new: &str) -> (f32, Vec<CharRange>, Vec<CharRange>) 
     (diff.ratio(), old_e, new_e)
 }
 
-/// Shrink each emphasis range off its leading and trailing whitespace, dropping any range
-/// that is all whitespace. So a highlight hugs the changed tokens — never bare indentation
-/// (a reformat that only deepened the indent) and never the space before an added trailing
-/// comment. Interior whitespace from [`coalesce_ws_gaps`] survives, since it is not an edge.
+/// Trim whitespace off each range's edges, dropping all-whitespace ranges.
 fn trim_range_edges(ranges: Vec<CharRange>, text: &str) -> Vec<CharRange> {
     let chars: Vec<char> = text.chars().collect();
     ranges
@@ -415,10 +539,7 @@ fn trim_range_edges(ranges: Vec<CharRange>, text: &str) -> Vec<CharRange> {
         .collect()
 }
 
-/// Merge consecutive emphasis ranges whose in-between text is all whitespace, swallowing
-/// that whitespace into the highlight. A run of changed words then shows as one block
-/// rather than separate words with bare gaps; leading and trailing indentation, and gaps
-/// holding any non-space character, are left out because they never sit between two changes.
+/// Merge ranges separated only by whitespace, so a changed phrase reads as one span.
 fn coalesce_ws_gaps(ranges: Vec<CharRange>, text: &str) -> Vec<CharRange> {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<CharRange> = Vec::new();
@@ -449,9 +570,7 @@ fn push_range(ranges: &mut Vec<CharRange>, pos: u32, len: u32) {
 /// Context lines kept adjacent to each change; longer unchanged runs collapse to a fold.
 const FOLD_MARGIN: usize = 3;
 
-/// Replace each run of unchanged `Context` rows that exceeds the margin with a single
-/// `Fold` owning the hidden rows, keeping `FOLD_MARGIN` lines next to every change and
-/// at the file head and tail.
+/// Fold each long context run, keeping `FOLD_MARGIN` lines by every change and file end.
 fn collapse_context(rows: &[Row]) -> Vec<Row> {
     let n = rows.len();
     let mut keep = vec![false; n];
@@ -486,21 +605,18 @@ fn collapse_context(rows: &[Row]) -> Vec<Row> {
     out
 }
 
-/// The extension used to pick a syntax, e.g. `rs` for `src/app.rs`; `None` when the
-/// file name has no extension.
+/// The extension that picks a syntax, e.g. `rs` for `src/app.rs`.
 pub(crate) fn language_of(path: &str) -> Option<String> {
     Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_string)
 }
 
-/// Caches built `FileDiff`s by content, so an unchanged poll skips diffing and
-/// highlighting.
+/// Built `FileDiff`s by content, so an unchanged refresh rebuilds nothing.
 #[derive(Default, Debug)]
 pub struct DiffCache {
     entries: HashMap<String, (u64, FileDiff)>,
 }
 
-/// Cap the cache so a long session browsing many files cannot grow it without bound;
-/// at the cap it is cleared (only the open file is ever rebuilt).
+/// The cache clears at this size; only the open file rebuilds.
 const CACHE_CAP: usize = 256;
 
 impl DiffCache {
@@ -508,10 +624,7 @@ impl DiffCache {
         Self::default()
     }
 
-    /// Return the cached diff when `old`/`new`/`previous_path` are unchanged for `path`,
-    /// else build, cache, and return it. `previous_path` (the rename source) is part of the
-    /// key, so the same path appearing as a rename in one scope and plain in another never
-    /// returns a stale header; the cache is also cleared on a scope switch (`set_scope`).
+    /// The diff for `path`, keyed by both sides and `previous_path`, so a rename's header never leaks.
     pub fn get(
         &mut self,
         path: String,
@@ -524,17 +637,13 @@ impl DiffCache {
         self.get_or_build(path.clone(), key, || FileDiff::build(path, previous_path, old, new, hl))
     }
 
-    /// Return the cached File view when `content` is unchanged for `path`, else build it.
-    /// File-view entries are namespaced under a `file:` key so a path's File view and Diff
-    /// view coexist in the cache instead of evicting each other on a tab switch.
+    /// The File view for `path`, under a `file:` key so it never evicts the path's diff.
     pub fn get_file(&mut self, path: String, content: &str, hl: &Highlighter) -> FileDiff {
         let key = content_hash(None, content, content);
         self.get_or_build(format!("file:{path}"), key, || FileDiff::build_file(path, content, hl))
     }
 
-    /// Shared cache body: return the entry under `cache_key` when its stored hash still equals
-    /// `content_key`, else `build` it, evict-on-cap, and insert. Both [`get`](Self::get) and
-    /// [`get_file`](Self::get_file) differ only in the key and the build call.
+    /// The entry under `cache_key` while its hash is `content_key`, else a fresh `build`.
     fn get_or_build(
         &mut self,
         cache_key: String,
@@ -565,7 +674,7 @@ fn content_hash(previous_path: Option<&str>, old: &str, new: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffCache, FileDiff, FileState, Row, View, language_of};
+    use super::{DiffCache, FileDiff, Notice, Row, SIMILAR_WINDOW, View, language_of};
     use crate::highlight::Highlighter;
     use crate::theme;
 
@@ -584,7 +693,7 @@ mod tests {
         }
         let d = FileDiff::build_file("a.rs".into(), &content, &hl);
         assert_eq!(d.view, View::File);
-        assert_eq!(d.state, FileState::Normal);
+        assert_eq!(d.notice, None);
         assert_eq!(d.rows.len(), 40);
         assert!(d.rows.iter().all(|r| matches!(r, Row::Context { .. })), "every row is context");
         // Even a long unchanged run never folds in the File view.
@@ -597,7 +706,7 @@ mod tests {
     fn file_view_degrades_on_binary() {
         let hl = Highlighter::new(mocha());
         let d = FileDiff::build_file("blob.bin".into(), "a\0b", &hl);
-        assert_eq!(d.state, FileState::Binary);
+        assert_eq!(d.notice, Some(Notice::Binary));
         assert_eq!(d.view, View::File);
         assert!(d.rows.is_empty());
     }
@@ -611,8 +720,7 @@ mod tests {
     fn cache_keys_on_previous_path_so_a_rename_and_a_plain_edit_differ() {
         let hl = Highlighter::new(mocha());
         let mut cache = DiffCache::new();
-        // Same path + same content, but one is a rename (carries a previous_path) and one is
-        // not. The cache must not return the rename's build for the plain edit.
+        // Same path and content, one a rename: the plain edit must not get the rename's build.
         let renamed = cache.get("f.rs".into(), Some("old.rs".into()), "x\n", "y\n", &hl);
         let plain = cache.get("f.rs".into(), None, "x\n", "y\n", &hl);
         assert_eq!(renamed.previous_path.as_deref(), Some("old.rs"));
@@ -622,7 +730,7 @@ mod tests {
     #[test]
     fn rows_carry_sides_numbers_and_markers() {
         let d = build("alpha\nbeta\ngamma\n", "alpha\nBETA\ngamma\n");
-        assert_eq!(d.state, FileState::Normal);
+        assert_eq!(d.notice, None);
         let del = d.rows.iter().find(|r| matches!(r, Row::Deletion { .. })).unwrap();
         let ins = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
         assert_eq!(del.old_no(), Some(2));
@@ -634,6 +742,81 @@ mod tests {
         assert!(d.rows.iter().filter(|r| matches!(r, Row::Context { .. })).count() >= 2);
     }
 
+    /// The changed rows, each with whether it marks a CR.
+    fn changes(d: &FileDiff) -> Vec<(String, bool)> {
+        d.rows
+            .iter()
+            .filter(|r| r.marker() != ' ')
+            .map(|r| (r.marker_text(), r.cr_marker()))
+            .collect()
+    }
+
+    #[test]
+    fn a_changed_line_ending_shows_its_cr_and_a_shared_one_does_not() {
+        // Only the ending changed: the gained CR is the one difference, marked, never text.
+        let d = build("alpha\nbeta\n", "alpha\r\nbeta\n");
+        assert_eq!(changes(&d), [("-alpha".into(), false), ("+alpha".into(), true)]);
+        assert_eq!(d.pairs, [(1, 1)], "the line pairs with its twin");
+        // CRLF throughout: an edit shows its text, and no ending changed.
+        let d = build("alpha\r\nbeta\r\n", "alpha\r\nBETA\r\n");
+        assert_eq!(changes(&d), [("-beta".into(), false), ("+BETA".into(), false)]);
+        // One block, two edited lines: only the line whose own ending changed is marked.
+        let d = build("alpha\r\nbeta\n", "alpha!\r\nbeta\r\n");
+        assert_eq!(
+            changes(&d),
+            [
+                ("-alpha".into(), false),
+                ("-beta".into(), false),
+                ("+alpha!".into(), false),
+                ("+beta".into(), true),
+            ]
+        );
+        // Pairs that each keep their ending mark nothing.
+        let d = build("x\r\ny\n", "X\r\ny2\n");
+        assert!(changes(&d).iter().all(|&(_, cr)| !cr), "{:?}", changes(&d));
+        // An unpaired line has no old ending to compare: an added CRLF line is unmarked.
+        let d = build("alpha\n", "alpha\nzzz\r\n");
+        assert_eq!(changes(&d), [("+zzz".into(), false)]);
+        // A similar line inserted ahead cannot take the edited line's twin.
+        let d = build("a = 1;\n", "a = 2;\r\na = 1;\r\n");
+        assert_eq!(
+            changes(&d),
+            [("-a = 1;".into(), false), ("+a = 2;".into(), false), ("+a = 1;".into(), true)]
+        );
+        // The emphasis pairs the same twin the marker does.
+        assert_eq!(d.pairs, [(1, 2)]);
+    }
+
+    #[test]
+    fn swapped_lines_keep_their_ending_marks() {
+        let d = build("alpha one\r\nbeta two\r\n", "beta two\nalpha one\n");
+        assert_eq!(
+            changes(&d),
+            [
+                ("-alpha one".into(), true),
+                ("-beta two".into(), true),
+                ("+beta two".into(), false),
+                ("+alpha one".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_cr_inside_a_line_breaks_no_line() {
+        // git splits lines on `\n` alone: the CR is text, and line 2 is `let d`.
+        let d = build("let c\r= 3;\nlet d = 4;\n", "let c\r= 3;\nlet d = 5;\n");
+        let rows: Vec<(Option<u32>, Option<u32>, String)> =
+            d.rows.iter().map(|r| (r.old_no(), r.new_no(), r.marker_text())).collect();
+        assert_eq!(
+            rows,
+            [
+                (Some(1), Some(1), " let c\r= 3;".to_string()),
+                (Some(2), None, "-let d = 4;".to_string()),
+                (None, Some(2), "+let d = 5;".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn long_unchanged_runs_collapse_to_a_fold() {
         use std::fmt::Write as _;
@@ -643,8 +826,7 @@ mod tests {
         }
         let new = old.replace("line 20", "LINE 20");
         let d = build(&old, &new);
-        // The middle is one change with 3 context lines each side; the long head and tail
-        // unchanged runs each collapse to a fold.
+        // The long unchanged head and tail each fold.
         let folds = d.rows.iter().filter(|r| matches!(r, Row::Fold { .. })).count();
         assert_eq!(folds, 2, "leading and trailing runs fold");
         let change = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
@@ -656,8 +838,7 @@ mod tests {
         let d = build("let x = foo(a);\n", "let x = bar(a, b);\n");
         let del = d.rows.iter().find(|r| matches!(r, Row::Deletion { .. })).unwrap();
         let ins = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
-        // Both lines share the `let x = ` and `(a` prefix; `foo`→`bar` and the `, b` are
-        // the only emphasized spans, never the whole line.
+        // Only `foo`→`bar` and `, b` are emphasized.
         assert!(!del.emphasis().is_empty() && !ins.emphasis().is_empty());
         let covers = |row: &Row, needle: &str| {
             let text = row.text();
@@ -674,8 +855,7 @@ mod tests {
 
     #[test]
     fn adjacent_changed_words_coalesce_across_whitespace() {
-        // `Hi You` → `Hello There`: two changed words split by a space. The emphasis is a
-        // single block spanning the space, not two fragments — the Word-Alt look.
+        // Two changed words split by a space emphasize as one block.
         let d = build("greet Hi You here\n", "greet Hello There here\n");
         let del = d.rows.iter().find(|r| matches!(r, Row::Deletion { .. })).unwrap();
         let ins = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
@@ -690,10 +870,7 @@ mod tests {
 
     #[test]
     fn emphasis_pairs_a_deletion_with_its_homolog_not_its_position() {
-        // One line edited, with a new line inserted above it. Positional pairing would pair
-        // the deletion with the inserted comment (dissimilar → nothing); homolog search skips
-        // the comment and pairs with the real edit, so `compute`→`computeSum` lights up and
-        // the unrelated inserted line stays plain.
+        // A line inserted above an edit: the edit pairs with its homolog, not the new line.
         let d = build("let total = compute();\n", "// added\nlet total = computeSum();\n");
         let seg = |row: &Row| -> String {
             let (a, b) = row.emphasis()[0];
@@ -709,8 +886,7 @@ mod tests {
 
     #[test]
     fn emphasis_hugs_the_tokens_not_surrounding_whitespace() {
-        // Adding a trailing comment: the highlight is `// note`, not ` // note` — leading
-        // whitespace is trimmed off the range so it never paints bare spaces.
+        // An added trailing comment highlights `// note`, not the space before it.
         let d = build("    let x = 1;\n", "    let x = 1; // note\n");
         let ins = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
         assert_eq!(ins.emphasis().len(), 1);
@@ -721,9 +897,7 @@ mod tests {
 
     #[test]
     fn a_reformat_or_unrelated_pair_is_not_emphasized() {
-        // A one-liner reformatted to multi-line, and two different statements sharing a
-        // `let … ;` skeleton, both fall below the similarity bar — they scatter unhelpful
-        // fragments otherwise. Each keeps only its line-level red/green.
+        // A reformat and two `let`s sharing a skeleton stay below the bar, unemphasized.
         let reformat = build(
             "    rows.push(Row::Deletion { old_no: oi + 1, spans: s });\n",
             "    rows.push(Row::Deletion {\n        old_no: oi + 1,\n        spans: s,\n    });\n",
@@ -742,9 +916,7 @@ mod tests {
 
     #[test]
     fn a_wholesale_line_rewrite_gets_no_word_emphasis() {
-        // Two unrelated lines that merely share `///` and punctuation must not light up:
-        // the line-level red/green already says they changed, and full-line emphasis on a
-        // dissimilar pair is noise. The similarity gate suppresses it.
+        // Two unrelated lines sharing only `///` and punctuation stay unemphasized.
         let d = build(
             "/// Keep diff_scroll so the cursor stays within the viewport\n",
             "/// Scroll the diff horizontally by delta columns\n",
@@ -768,9 +940,25 @@ mod tests {
     }
 
     #[test]
+    fn a_similar_line_past_the_window_stays_unpaired() {
+        use std::fmt::Write as _;
+        let pairs_with = |unlike: usize| {
+            let mut new = String::new();
+            for i in 0..unlike {
+                writeln!(new, "zz{i} qq{i} ww{i}").unwrap();
+            }
+            new.push_str("let total = sum + 2;\n");
+            build("let total = sum + 1;\n", &new).pairs
+        };
+        let at = |n: usize| u32::try_from(n + 1).unwrap();
+        assert_eq!(pairs_with(SIMILAR_WINDOW - 1), [(1, at(SIMILAR_WINDOW - 1))]);
+        assert!(pairs_with(SIMILAR_WINDOW).is_empty());
+    }
+
+    #[test]
     fn binary_content_is_flagged_not_rowed() {
         let d = build("ok\n", "bin\0ary\n");
-        assert_eq!(d.state, FileState::Binary);
+        assert_eq!(d.notice, Some(Notice::Binary));
         assert!(d.rows.is_empty());
     }
 

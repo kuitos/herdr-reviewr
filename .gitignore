@@ -1,5 +1,7 @@
-# Rust
+# Rust. Every build dir is target or target-<something> (a cross build like target-xwin, a
+# second dir for an A/B bench), and none is ever committed.
 /target/
+/target-*/
 **/*.rs.bk
 Cargo.lock.bak
 

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Run PowerShell in the Windows QA VM over SSH: scripts/windows-vm/vm 'herdr --version'
+set -euo pipefail
+exec ssh -p 2222 -i "$HOME/.ssh/reviewr_win_vm" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o BatchMode=yes -o LogLevel=ERROR reviewr@127.0.0.1 "$@"
