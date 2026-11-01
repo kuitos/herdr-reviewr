@@ -1,7 +1,7 @@
 name: release
 
-# Build prebuilt binaries for each supported platform and attach them to the GitHub Release
-# whenever a v* tag is pushed. herdr/install.sh downloads the matching asset on plugin install.
+# On a v* tag, build each platform's binary and attach it to the release, where the plugin's
+# installers (install.sh, install.ps1) download it.
 on:
   push:
     tags: ["v*"]
@@ -20,12 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # The release body is the tag's CHANGELOG.md section, so the page a human lands on says
-      # what changed. The action parses the Keep-a-Changelog format and fails when the tag has
-      # no section, so a forgotten changelog entry fails the release instead of shipping the
-      # bare compare link. Idempotent: an existing release is left as is.
-      # Draft until the binaries attach: the repo publishes immutable releases, which refuse
-      # asset uploads after publish — so publish is the pipeline's last step, not its first.
+      # The body is the tag's CHANGELOG section, and a missing one fails the release. A draft, since
+      # an immutable release refuses assets once published.
       - uses: taiki-e/create-gh-release-action@v1
         with:
           changelog: CHANGELOG.md
@@ -45,28 +41,31 @@ jobs:
           - { target: x86_64-apple-darwin, os: macos-latest }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
       - uses: actions/checkout@v7
 
-      # Builds herdr-reviewr for the target (cross-compiling aarch64 Linux via `cross` as needed),
-      # archives it as herdr-reviewr-<target>.tar.gz with a .sha256 sidecar, and uploads both to
-      # the release for this tag. The toolchain is pinned by rust-toolchain.toml.
+      # Build, archive as herdr-reviewr-<target>.tar.gz (.zip on Windows) with a .sha256 sidecar,
+      # and upload: the installers download exactly these names.
       - uses: taiki-e/upload-rust-binary-action@v1
+        id: upload
         with:
           bin: herdr-reviewr
           target: ${{ matrix.target }}
           archive: $bin-$target
+          tar: unix
+          zip: windows
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # The archive the step above built and uploaded gets a signed provenance attestation.
+      # The archive the step above built and uploaded gets a signed provenance attestation. The
+      # step names the one archive it built for this platform, .zip or .tar.gz.
       - uses: actions/attest-build-provenance@v4
         with:
-          subject-path: herdr-reviewr-${{ matrix.target }}.tar.gz
+          subject-path: ${{ steps.upload.outputs.zip || steps.upload.outputs.tar }}
 
-  # Publish once every target's assets are attached. Publishing seals an immutable release,
-  # so this runs last; a failed target leaves the draft for inspection instead of shipping a
-  # release that installs 404.
+  # Publish last, once every asset is attached: a failed target leaves a draft, never a release
+  # that installs 404.
   publish:
     needs: binaries
     runs-on: ubuntu-latest

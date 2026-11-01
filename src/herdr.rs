@@ -1,54 +1,42 @@
-//! herdr host integration: resolve the agent pane to send to and check it can take text,
-//! sample the agents turn tracking watches, ask herdr for the plugin config directory, and
-//! stamp/clear the pane's cosmetic `reviewr` label.
-//!
-//! Uses the herdr CLI via `$HERDR_BIN_PATH`. The two agent readers
-//! ask different questions and neither narrows the other: [`send_target`] resolves candidates
-//! from the reviewr pane's herdr workspace, while [`agent_samples`] reports every agent and lets
-//! the caller decide membership by worktree. Browsing and the clipboard export never come
-//! through here.
+//! herdr integration: the CLI via `$HERDR_BIN_PATH`, and the send over its socket API.
 
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::logln;
 use crate::turn::Status;
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-
-#[derive(Debug, Deserialize)]
-struct AgentListResponse {
-    result: AgentList,
-}
 
 #[derive(Debug, Deserialize)]
 struct AgentList {
     agents: Vec<AgentPane>,
 }
 
-/// One entry of `herdr agent list`. The picker-facing fields are optional: herdr 0.7.5 omits
-/// `name`, `display_agent`, and `state_labels` entirely until something sets them, and
-/// `herdr agent rename --clear` leaves `name` present and null. Both parse to `None`. The
-/// identity fields stay required, so a payload missing `pane_id` fails the parse loudly
-/// instead of minting an unaddressable send target.
-///
-/// `agent_status` is kept as herdr spelled it, not as the [`Status`] it parses to: the picker
-/// row shows the spelling and looks its label up by it, so a state herdr adds must survive a
-/// round trip reviewr does not understand.
+/// herdr's optional strings: null, absent and `""` all read as `None`.
+fn non_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|text| !text.is_empty()))
+}
+
+/// One `herdr agent list` entry: identity fields required, picker fields optional.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 struct AgentPane {
+    #[serde(default, deserialize_with = "non_empty")]
     agent: Option<String>,
     agent_status: String,
     pane_id: String,
     tab_id: String,
     workspace_id: String,
-    /// Where the agent works. Turn tracking resolves it to a git top level to decide which
-    /// worktree the agent belongs to.
+    /// Where the agent works: turn tracking maps it to a worktree.
+    #[serde(default, deserialize_with = "non_empty")]
     cwd: Option<String>,
+    #[serde(default, deserialize_with = "non_empty")]
     name: Option<String>,
+    #[serde(default, deserialize_with = "non_empty")]
     display_agent: Option<String>,
     state_labels: Option<HashMap<String, String>>,
 }
@@ -62,8 +50,7 @@ pub struct AgentChoice {
     pub tab: String,
 }
 
-/// What `Send` does with the agents herdr reports. A refusal is the
-/// `Err` of [`send_target`], so zero agents and a failed enumeration land in one place.
+/// What `Send` does with the agents herdr reports; a refusal is [`send_target`]'s `Err`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendTarget {
     /// Exactly one agent. The send goes straight to it, with no picker.
@@ -72,85 +59,366 @@ pub enum SendTarget {
     Many(Vec<AgentChoice>),
 }
 
+/// The plugin's id, as herdr knows it: its config dir, its state dir, its pane entrypoint.
+pub(crate) const PLUGIN_ID: &str = "persiyanov.reviewr";
+
+/// A herdr context variable; herdr leaves one unset or empty alike.
+pub(crate) fn var(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// A herdr path variable, which need not be UTF-8; unset or empty alike.
+pub(crate) fn var_os(name: &str) -> Option<OsString> {
+    env::var_os(name).filter(|value| !value.is_empty())
+}
+
+/// The plugin id herdr runs this as, else the published one.
+pub(crate) fn plugin_id() -> String {
+    var("HERDR_PLUGIN_ID").unwrap_or_else(|| PLUGIN_ID.to_owned())
+}
+
+/// The label reviewr stamps on its pane and tab; display only, never identity.
+pub(crate) const LABEL: &str = "reviewr";
+
+/// The herdr binary herdr names, else `herdr` on `PATH`. An empty value names nothing.
 fn herdr_bin() -> String {
-    env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
+    var("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into())
 }
 
-/// Run a herdr subcommand and return its stdout.
-///
-/// Nothing shows this error to a reviewer: every caller either replaces it with a sentence of its
-/// own or drops it. So the whole of it — the argv, which carries a review's text in `pane
-/// send-text`, and herdr's JSON error envelope — goes to the log and only there.
-fn herdr(args: &[&str]) -> Result<String> {
-    let out = match crate::proc::command(herdr_bin()).args(args).output() {
-        Ok(out) => out,
-        Err(e) => {
-            logln!("herdr {args:?} could not run: {e}");
-            bail!("herdr could not run");
-        }
-    };
-    if !out.status.success() {
-        logln!("herdr {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-        bail!("herdr refused");
+/// How a herdr call failed, classified so a caller can tell a benign race from a real failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HerdrError {
+    /// herdr gave no answer: not run, not reachable, or not within its bound.
+    Unanswered,
+    /// herdr exited non-zero, with its error envelope's `error.code` when it wrote one.
+    Refused(Option<String>),
+    /// herdr exited 0 without the shape the call documents, never read as empty.
+    Unreadable,
+    /// The addressed pane no longer exists: it exited between an earlier read and this call.
+    PaneGone,
+}
+
+/// Why a review did not reach an agent's input.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendError {
+    /// herdr failed a call the send made.
+    Herdr(HerdrError),
+    /// The named agent waits on a permission or confirm prompt, which would drop a paste.
+    AtPrompt(String),
+    /// The pane's screen shows a dialog's key hints. Codex reports `idle` under its model picker.
+    Dialog,
+    /// The workspace holds no agent to send to.
+    NoAgent,
+    /// The review is over the send cap, so it cannot go as one paste.
+    TooLarge,
+}
+
+impl From<HerdrError> for SendError {
+    fn from(error: HerdrError) -> Self {
+        Self::Herdr(error)
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// How long a startup or exit path waits for a herdr answer before moving on. The call keeps
-/// running on its own thread — only the wait is bounded — so a wedged herdr costs at most
-/// this once and never wedges reviewr with it: not the first paint, not the event loop's
-/// entry, and not the shell prompt after exit.
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Herdr(error) => error.fmt(f),
+            Self::AtPrompt(name) => write!(f, "{name} is at a prompt"),
+            Self::Dialog => write!(f, "the agent has a dialog open"),
+            Self::NoAgent => write!(f, "no agent in the workspace"),
+            Self::TooLarge => write!(f, "the review is over the {MAX_REQUEST_BYTES}-byte send cap"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
+impl HerdrError {
+    /// A refusal carrying herdr's `error.code`, a gone pane read as such.
+    fn refused(code: Option<String>) -> Self {
+        match code.as_deref() {
+            Some("pane_not_found") => Self::PaneGone,
+            _ => Self::Refused(code),
+        }
+    }
+}
+
+impl std::fmt::Display for HerdrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unanswered => write!(f, "herdr didn't answer"),
+            Self::Refused(Some(code)) => write!(f, "herdr refused: {code}"),
+            Self::Refused(None) => write!(f, "herdr refused"),
+            Self::Unreadable => write!(f, "herdr answered in an unknown shape"),
+            Self::PaneGone => write!(f, "the pane is gone"),
+        }
+    }
+}
+
+impl std::error::Error for HerdrError {}
+
+/// Run a herdr subcommand: its stdout, or the classified failure, logged in full.
+fn call(args: &[&str]) -> Result<String, HerdrError> {
+    use crate::proc::RunError;
+    let mut cmd = crate::proc::command(herdr_bin());
+    cmd.args(args);
+    let deadline = Instant::now() + CALL_BOUND;
+    match crate::proc::run_tree(cmd, || Instant::now() >= deadline) {
+        Ok(stdout) => Ok(stdout),
+        Err(RunError::Failed { stderr }) => {
+            logln!("herdr {args:?} failed: {}", stderr.trim());
+            Err(HerdrError::refused(error_code(&stderr)))
+        }
+        Err(RunError::Stopped) => {
+            logln!("herdr {args:?} unanswered after {CALL_BOUND:?}");
+            Err(HerdrError::Unanswered)
+        }
+        Err(error) => {
+            logln!("herdr {args:?} could not run: {error:?}");
+            Err(HerdrError::Unanswered)
+        }
+    }
+}
+
+/// How long one herdr CLI call may run, so a wedged herdr never holds an action's lock.
+pub(crate) const CALL_BOUND: Duration = Duration::from_secs(8);
+
+/// The `error.code` of the envelope a failed call writes to stderr, read line by line.
+fn error_code(stderr: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        error: ErrorBody,
+    }
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        code: String,
+    }
+    stderr
+        .lines()
+        .find_map(|line| serde_json::from_str::<Envelope>(line.trim()).ok())
+        .map(|envelope| envelope.error.code)
+}
+
+/// The `result` of a herdr JSON answer as `T`, else [`HerdrError::Unreadable`].
+fn answer<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, HerdrError> {
+    #[derive(Deserialize)]
+    struct Answer<T> {
+        result: T,
+    }
+    serde_json::from_str::<Answer<T>>(json).map(|answer| answer.result).map_err(|error| {
+        logln!("herdr answer unreadable: {error}");
+        HerdrError::Unreadable
+    })
+}
+
+/// One `herdr pane list` snapshot of a workspace.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneList {
+    pub(crate) panes: Vec<PaneEntry>,
+}
+
+/// One pane in a [`PaneList`]; an entry without a `pane_id` fails the parse.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneEntry {
+    pub(crate) pane_id: String,
+    /// The live foreground process's cwd, which can differ from the launch cwd.
+    #[serde(default, deserialize_with = "non_empty")]
+    pub(crate) foreground_cwd: Option<String>,
+    #[serde(default, deserialize_with = "non_empty")]
+    label: Option<String>,
+    /// The agent herdr detects in the pane; absent for a shell or a plugin pane.
+    #[serde(default, deserialize_with = "non_empty")]
+    pub(crate) agent: Option<String>,
+}
+
+impl PaneList {
+    /// The panes in workspace `ws`.
+    pub(crate) fn of(ws: &str) -> Result<Self, HerdrError> {
+        answer(&call(&["pane", "list", "--workspace", ws])?)
+    }
+
+    /// The entry for pane `pane`, if the snapshot lists it.
+    pub(crate) fn pane(&self, pane: &str) -> Option<&PaneEntry> {
+        self.panes.iter().find(|entry| entry.pane_id == pane)
+    }
+}
+
+/// The checkouts herdr manages for its installed plugins; a linked plugin's folder is the user's.
+pub(crate) fn managed_plugin_dirs() -> Result<Vec<PathBuf>, HerdrError> {
+    #[derive(Deserialize)]
+    struct Plugins {
+        plugins: Vec<Plugin>,
+    }
+    #[derive(Deserialize)]
+    struct Plugin {
+        #[serde(default)]
+        source: Option<Source>,
+    }
+    #[derive(Deserialize)]
+    struct Source {
+        #[serde(default)]
+        managed_path: Option<PathBuf>,
+    }
+    let list: Plugins = answer(&call(&["plugin", "list", "--json"])?)?;
+    Ok(list.plugins.into_iter().filter_map(|plugin| plugin.source?.managed_path).collect())
+}
+
+/// The processes herdr reports in a pane's foreground: the group on unix, one process on Windows.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProcessInfo {
+    /// Required: an answer without it is a shape failure, never zero processes.
+    #[serde(rename = "pane_id")]
+    _pane_id: String,
+    /// herdr omits an empty list, so an absent key is zero processes.
+    #[serde(default)]
+    pub(crate) foreground_processes: Vec<Process>,
+}
+
+/// One foreground process, identified by its executable, never its rewritable title.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Process {
+    #[serde(default, deserialize_with = "non_empty")]
+    pub(crate) argv0: Option<String>,
+    #[serde(default)]
+    pub(crate) argv: Vec<String>,
+}
+
+impl ProcessInfo {
+    /// The foreground processes of pane `pane`.
+    pub(crate) fn of(pane: &str) -> Result<Self, HerdrError> {
+        Self::parse(&call(&["pane", "process-info", "--pane", pane])?)
+    }
+
+    fn parse(json: &str) -> Result<Self, HerdrError> {
+        #[derive(Deserialize)]
+        struct Result {
+            process_info: ProcessInfo,
+        }
+        answer::<Result>(json).map(|result| result.process_info)
+    }
+}
+
+/// The pane a `herdr plugin pane open` created.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenedPane {
+    pub(crate) pane_id: String,
+    #[serde(default, deserialize_with = "non_empty")]
+    pub(crate) tab_id: Option<String>,
+}
+
+/// Where `plugin pane open` puts a pane, with what that placement needs.
+#[derive(Debug)]
+pub(crate) enum Spot<'a> {
+    Split { target: &'a str, direction: crate::config::ToggleDirection },
+    Zoomed { target: &'a str },
+    Tab { workspace: &'a str },
+    Overlay,
+}
+
+/// Where and how `plugin pane open` opens a plugin's pane.
+#[derive(Debug)]
+pub(crate) struct PaneOpen<'a> {
+    pub(crate) plugin: &'a str,
+    pub(crate) spot: Spot<'a>,
+    pub(crate) cwd: &'a str,
+    pub(crate) focus: bool,
+}
+
+/// Open one of a plugin's panes.
+pub(crate) fn open_plugin_pane(open: &PaneOpen) -> Result<OpenedPane, HerdrError> {
+    #[derive(Deserialize)]
+    struct Result {
+        plugin_pane: PluginPane,
+    }
+    #[derive(Deserialize)]
+    struct PluginPane {
+        pane: OpenedPane,
+    }
+    let mut args = vec!["plugin", "pane", "open", "--plugin", open.plugin, "--entrypoint", "pane"];
+    match open.spot {
+        Spot::Split { target, direction } => {
+            args.extend([
+                "--placement",
+                "split",
+                "--target-pane",
+                target,
+                "--direction",
+                direction.as_str(),
+            ]);
+        }
+        Spot::Zoomed { target } => args.extend(["--placement", "zoomed", "--target-pane", target]),
+        Spot::Tab { workspace } => args.extend(["--placement", "tab", "--workspace", workspace]),
+        Spot::Overlay => args.extend(["--placement", "overlay"]),
+    }
+    args.extend(["--cwd", open.cwd, if open.focus { "--focus" } else { "--no-focus" }]);
+    let opened = answer::<Result>(&call(&args)?)?.plugin_pane.pane;
+    if opened.pane_id.is_empty() {
+        return Err(HerdrError::Unreadable);
+    }
+    Ok(opened)
+}
+
+/// Close pane `pane` by id with `pane close`, which reaches any pane.
+pub(crate) fn close_pane(pane: &str) -> Result<(), HerdrError> {
+    call(&["pane", "close", pane]).map(drop)
+}
+
+/// Set tab `tab`'s label.
+pub(crate) fn rename_tab(tab: &str, label: &str) -> Result<(), HerdrError> {
+    call(&["tab", "rename", tab, label]).map(drop)
+}
+
+/// How long a startup or exit path waits for herdr; the call itself runs on.
 const ANSWER_BOUND: Duration = Duration::from_secs(2);
 
-/// How long a herdr answer may take before the caller signals the wait. Under this, the
-/// answer is effectively instant and nothing flashes; over it, the caller says what it is
-/// waiting on, so a slow answer never swaps the screen silently
-/// (`policies/ux-responsiveness.md`).
-const SIGNAL_DELAY: Duration = Duration::from_millis(150);
-
-/// Run a herdr subcommand on its own thread and hand back the channel its answer lands on.
-/// Dropping the receiver makes the call fire-and-forget; the thread still reaps the child
-/// either way, and a failure logs inside [`herdr`] as usual.
-fn herdr_on_thread(args: Vec<String>) -> mpsc::Receiver<Result<String>> {
+/// Run a herdr subcommand on its own thread; drop the receiver to fire and forget.
+fn herdr_on_thread(args: Vec<String>) -> mpsc::Receiver<Result<String, HerdrError>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let _ = tx.send(herdr(&refs));
+        let _ = tx.send(call(&refs));
     });
     rx
 }
 
-/// Stamp our own pane's cosmetic `reviewr` label — but only when the pane carries no label,
-/// so a name the user gave their pane survives running reviewr in it (reviewr supplies the default name, never overrides one). Display only:
-/// the actions and the event identify a reviewr pane by its foreground process, never this
-/// label, so a failed read or write just logs — and nothing waits on it, so a hung herdr
-/// cannot sit between the first paint and the event loop. Without a pane id — outside
-/// herdr — a no-op.
-pub fn label_pane() {
-    let (Ok(ws), Ok(pane)) = (env::var("HERDR_WORKSPACE_ID"), env::var("HERDR_PANE_ID")) else {
-        return;
-    };
+/// The socket and pane id the herdr connection needs; `None` outside herdr.
+pub fn connection_target() -> Option<(OsString, String)> {
+    Some((var_os("HERDR_SOCKET_PATH")?, var("HERDR_PANE_ID")?))
+}
+
+/// This pane's (workspace, pane) ids: the environment's at launch, then what the herdr
+/// connection sees, since a move to another tab or workspace changes them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneIds {
+    pub workspace: Option<String>,
+    pub pane: Option<String>,
+}
+
+impl PaneIds {
+    /// The ids herdr launched this pane with; none outside herdr.
+    pub fn from_env() -> Self {
+        Self { workspace: var("HERDR_WORKSPACE_ID"), pane: var("HERDR_PANE_ID") }
+    }
+}
+
+/// Stamp our pane's `reviewr` label unless the user named it; best effort, never waited on.
+pub fn label_pane(ids: &PaneIds) {
+    let (Some(ws), Some(pane)) = (ids.workspace.clone(), ids.pane.clone()) else { return };
     thread::spawn(move || {
-        // An unreadable listing stamps anyway: with herdr wedged the rename fails too,
-        // and both failures land in the log.
+        // An unreadable listing stamps anyway: the rename fails too, and both log.
         if current_label(&ws, &pane).is_none() {
-            let _ = herdr(&["pane", "rename", &pane, "reviewr"]);
+            let _ = call(&["pane", "rename", &pane, LABEL]);
         }
     });
 }
 
-/// Clear the cosmetic label on a normal exit — but only a `reviewr` label, so a name the
-/// user set is never deleted. The wait is bounded:
-/// this runs after the terminal is restored, and a hung herdr must not hold the shell
-/// prompt hostage for a label a stale copy of which changes nothing.
-pub fn clear_pane_label() {
-    let (Ok(ws), Ok(pane)) = (env::var("HERDR_WORKSPACE_ID"), env::var("HERDR_PANE_ID")) else {
-        return;
-    };
+/// Clear our `reviewr` label on exit, waiting at most a bound.
+pub fn clear_pane_label(ids: &PaneIds) {
+    let (Some(ws), Some(pane)) = (ids.workspace.clone(), ids.pane.clone()) else { return };
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        if current_label(&ws, &pane).as_deref() == Some("reviewr") {
-            let _ = herdr(&["pane", "rename", &pane, "--clear"]);
+        if current_label(&ws, &pane).as_deref() == Some(LABEL) {
+            let _ = call(&["pane", "rename", &pane, "--clear"]);
         }
         let _ = tx.send(());
     });
@@ -159,131 +427,36 @@ pub fn clear_pane_label() {
     }
 }
 
-/// Our pane's current label from `pane list`, or `None` when it has none or the listing
-/// fails. Blocking — the label threads call it, never the frame loop.
+/// Our pane's label, `None` when unset or unreadable; blocking, so never on the frame loop.
 fn current_label(ws: &str, pane: &str) -> Option<String> {
-    parse_pane_label(&herdr(&["pane", "list", "--workspace", ws]).ok()?, pane)
+    PaneList::of(ws).ok()?.pane(pane)?.label.clone()
 }
 
-/// The `label` of pane `pane` in a `pane list` envelope. Absent key, empty label, unknown
-/// pane, and an unparseable envelope all read as no label.
-fn parse_pane_label(json: &str, pane: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Response {
-        result: PaneList,
-    }
-    #[derive(Deserialize)]
-    struct PaneList {
-        panes: Vec<PaneEntry>,
-    }
-    #[derive(Deserialize)]
-    struct PaneEntry {
-        pane_id: String,
-        #[serde(default)]
-        label: Option<String>,
-    }
-    let response: Response = serde_json::from_str(json).ok()?;
-    response
-        .result
-        .panes
-        .into_iter()
-        .find(|entry| entry.pane_id == pane)?
-        .label
-        .filter(|label| !label.is_empty())
-}
-
-/// The config directory herdr resolves for this plugin, from `herdr plugin config-dir`.
-/// `None` — herdr absent, refusing, or not answering — means no config directory, never an
-/// error.
+/// This plugin's config directory from herdr, `None` when herdr cannot say.
 pub fn plugin_config_dir() -> Option<String> {
-    plugin_config_dir_with(|| ())
-}
-
-/// [`plugin_config_dir`] with a slow-answer signal: `on_slow` runs once if the answer takes
-/// longer than [`SIGNAL_DELAY`], so the pane can say what it is waiting on instead of
-/// silently swapping a painted frame later. The pane calls this only after its first paint,
-/// and the total wait stays bounded by [`ANSWER_BOUND`], so a wedged herdr degrades a
-/// visible pane to the defaults instead of holding the blank grid issue #4 fixed.
-pub fn plugin_config_dir_with(on_slow: impl FnOnce()) -> Option<String> {
-    let rx =
-        herdr_on_thread(vec!["plugin".into(), "config-dir".into(), "persiyanov.reviewr".into()]);
-    let answer = if let Ok(answer) = rx.recv_timeout(SIGNAL_DELAY) {
-        answer
-    } else {
-        on_slow();
-        let Ok(answer) = rx.recv_timeout(ANSWER_BOUND.saturating_sub(SIGNAL_DELAY)) else {
-            logln!("plugin config-dir unanswered after {ANSWER_BOUND:?}; no config directory");
-            return None;
-        };
-        answer
+    let rx = herdr_on_thread(vec!["plugin".into(), "config-dir".into(), plugin_id()]);
+    let Ok(answer) = rx.recv_timeout(ANSWER_BOUND) else {
+        logln!("plugin config-dir unanswered after {ANSWER_BOUND:?}; no config directory");
+        return None;
     };
     let out = answer.ok()?;
     let dir = out.trim();
     (!dir.is_empty()).then(|| dir.to_owned())
 }
 
-/// The (workspace, pane) id pair identifying this reviewr pane in the herdr environment. There is
-/// no tab here on purpose: the send scopes to the workspace and turn tracking scopes to the
-/// worktree, so nothing reads `HERDR_TAB_ID` and the reviewr pane's placement changes neither.
-fn agent_env() -> (Option<String>, Option<String>) {
-    (env::var("HERDR_WORKSPACE_ID").ok(), env::var("HERDR_PANE_ID").ok())
+/// The agents herdr lists: the one `agent list` call.
+fn agent_list() -> Result<Vec<AgentPane>, HerdrError> {
+    parse_agents(&call(&["agent", "list"])?)
 }
 
-/// The agents herdr currently lists. The one place the `agent list` call and its envelope
-/// parsing live, shared by the send's pane resolution and turn tracking's sampling.
-fn agent_list() -> Result<Vec<AgentPane>> {
-    parse_agents(&herdr(&["agent", "list"])?)
-}
-
-/// Why [`send_target`] found nowhere to send. Its `Display` is the batch send's whole status
-/// line; an immediate delivery says its own tail after [`NoTarget::cause`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoTarget {
-    /// The workspace holds no agent but our own pane.
-    NoAgent,
-    /// `agent list` failed, so there is no count to report.
-    NoAnswer,
-}
-
-impl NoTarget {
-    /// The refusal's cause alone, without the fallback it names.
-    pub fn cause(self) -> &'static str {
-        match self {
-            Self::NoAgent => "no agent here",
-            Self::NoAnswer => "herdr did not answer",
-        }
-    }
-}
-
-impl std::fmt::Display for NoTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} — copy to the clipboard instead", self.cause())
-    }
-}
-
-impl std::error::Error for NoTarget {}
-
-/// What `Send` does: one workspace agent sends directly, several open the picker, and no
-/// agent refuses. A failed enumeration refuses too, but says so rather
-/// than reporting a count herdr never gave. Either refusal is the whole status line, so both
-/// stay one short sentence naming the clipboard the reviewer can fall back to.
-pub fn send_target() -> Result<SendTarget, NoTarget> {
-    let (ws, me) = agent_env();
-    let agents = match agent_list() {
-        Ok(agents) => agents,
-        Err(e) => {
-            // A refusal is the whole status line, so it says the clipboard rather than herdr's
-            // own wording. The cause is already in the log, with the argv `herdr` kept out of it.
-            logln!("agent list failed: {e:#}");
-            return Err(NoTarget::NoAnswer);
-        }
-    };
-    // Candidacy is decided once, here: an `agent` field, our workspace, not our own pane.
-    // Rows keep `agent list` order, which is herdr's own. Turn
-    // tracking does not come through here: it asks where each agent works instead.
+/// What `Send` does: one agent sends, several open the picker, none refuses.
+pub fn send_target(ids: &PaneIds) -> Result<SendTarget, SendError> {
+    let (ws, me) = (ids.workspace.clone(), ids.pane.clone());
+    let agents = agent_list()?;
+    // Candidates: agents in our workspace other than our pane, in herdr's own order.
     let picked = candidates(&agents, ws.as_deref(), me.as_deref());
     match picked.len() {
-        0 => Err(NoTarget::NoAgent),
+        0 => Err(SendError::NoAgent),
         // The sole-agent send shows no row, so only the picker pays for the tab-label call.
         1 => Ok(SendTarget::One(picked[0].choice(&HashMap::new()))),
         _ => {
@@ -304,21 +477,17 @@ impl AgentPane {
         }
     }
 
-    /// The agent's `name`, else its `display_agent`, else its kind.
-    /// A cleared name arrives as null and falls through like an absent one. The pane id is a
-    /// last resort no live agent reaches, so the row and the success line always name something.
+    /// The agent's `name`, else `display_agent`, else its kind, else the pane id.
     fn row_name(&self) -> String {
         [&self.name, &self.display_agent, &self.agent]
             .into_iter()
             .flatten()
-            .find(|part| !part.is_empty())
+            .next()
             .cloned()
             .unwrap_or_else(|| self.pane_id.clone())
     }
 
-    /// The agent's `state_labels` entry for its state, else the state itself. Both the lookup
-    /// key and the fallback are herdr's own spelling, so a state reviewr does not know still
-    /// names itself on the row instead of reading `unknown`.
+    /// The state's label from `state_labels`, else herdr's own spelling, never `unknown`.
     fn row_state(&self) -> String {
         self.state_labels
             .as_ref()
@@ -333,39 +502,28 @@ impl AgentPane {
         Status::from_wire(&self.agent_status)
     }
 
-    /// A real agent pane other than our own — the shared gate both readers apply, so turn
-    /// sampling and send targeting never drift on what counts as an agent
-    /// (`../docs/herdr-api-notes.md`).
+    /// A real agent pane other than ours: the one gate the send and turn tracking share.
     fn is_agent_other_than(&self, me: Option<&str>) -> bool {
         self.agent.is_some() && Some(self.pane_id.as_str()) != me
     }
 }
 
-/// Tab id to tab label for one workspace. Labelling is best effort: a failed call or a
-/// missing tab leaves the row's tab part empty rather than failing the send.
+/// Tab id to label for one workspace; best effort, never failing the send.
 fn tab_labels(ws: Option<&str>) -> HashMap<String, String> {
     let Some(ws) = ws else { return HashMap::new() };
-    let Ok(json) = herdr(&["tab", "list", "--workspace", ws]) else {
+    let Ok(json) = call(&["tab", "list", "--workspace", ws]) else {
         return HashMap::new();
     };
     parse_tab_labels(&json).unwrap_or_default()
 }
 
-/// The documented `result.tabs` array from `herdr tab list`, as tab id → label. A tab
-/// without a label is dropped, so its rows show no tab part.
-fn parse_tab_labels(json: &str) -> Result<HashMap<String, String>> {
-    let response: TabListResponse = serde_json::from_str(json).context("parsing tab list")?;
-    Ok(response
-        .result
+/// `herdr tab list`'s labelled tabs, as tab id → label.
+fn parse_tab_labels(json: &str) -> Result<HashMap<String, String>, HerdrError> {
+    Ok(answer::<TabList>(json)?
         .tabs
         .into_iter()
         .filter_map(|tab| tab.label.map(|label| (tab.tab_id, label)))
         .collect())
-}
-
-#[derive(Debug, Deserialize)]
-struct TabListResponse {
-    result: TabList,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,46 +534,61 @@ struct TabList {
 #[derive(Debug, Deserialize)]
 struct TabInfo {
     tab_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "non_empty")]
     label: Option<String>,
 }
 
 /// The documented `result.agents` array from `herdr agent list`.
-fn parse_agents(json: &str) -> Result<Vec<AgentPane>> {
-    let response: AgentListResponse = serde_json::from_str(json).context("parsing agent list")?;
-    Ok(response.result.agents)
+fn parse_agents(json: &str) -> Result<Vec<AgentPane>, HerdrError> {
+    answer::<AgentList>(json).map(|list| list.agents)
 }
 
-/// One agent as turn tracking sees it: where it works, and what it is doing. Membership is
-/// the caller's to decide, since only the worker knows the reviewed worktree
+/// One agent as turn tracking sees it; membership is the caller's to decide.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSample {
     pub cwd: Option<String>,
     pub status: Status,
 }
 
-/// Every agent herdr reports, minus our own pane. Neither the tab nor the workspace narrows
-/// this (see the module header). `Err` means the enumeration failed, which the caller treats
-/// as "nothing changed" rather than "no agents".
-pub fn agent_samples() -> Result<Vec<AgentSample>> {
-    let (_, me) = agent_env();
-    Ok(samples_of(agent_list()?, me.as_deref()))
+/// A session snapshot's agents, read entry by entry; `None` when there is no list at all.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Sampled {
+    /// The real agents other than our own pane, each by its pane.
+    pub agents: Vec<(String, AgentSample)>,
+    /// The cwd of each entry herdr shaped unexpectedly, which may be an agent.
+    pub odd: Vec<Option<String>>,
 }
 
-/// The sampling rule, split out so it is testable without the CLI. Only entries carrying an
-/// `agent` field count, and our own pane never does.
-fn samples_of(agents: Vec<AgentPane>, me: Option<&str>) -> Vec<AgentSample> {
+/// Read a session snapshot's agent list; our own pane `me` is left out.
+pub(crate) fn samples_of(agents: &serde_json::Value, me: Option<&str>) -> Option<Sampled> {
+    let mut readable = Vec::new();
+    let mut odd = Vec::new();
+    for entry in agents.as_array()? {
+        match AgentPane::deserialize(entry) {
+            Ok(agent) => readable.push(agent),
+            // Our own pane, or a pane with no agent named: no agent, as for a readable entry.
+            Err(_) if me.is_some() && entry["pane_id"].as_str() == me => {}
+            Err(_)
+                if matches!(&entry["agent"], serde_json::Value::Null)
+                    || entry["agent"].as_str() == Some("") => {}
+            Err(_) => odd.push(entry["cwd"].as_str().filter(|c| !c.is_empty()).map(str::to_string)),
+        }
+    }
+    Some(Sampled { agents: samples_among(readable, me), odd })
+}
+
+/// The sampling rule: real agents other than our own pane.
+fn samples_among(agents: Vec<AgentPane>, me: Option<&str>) -> Vec<(String, AgentSample)> {
     agents
         .into_iter()
         .filter(|agent| agent.is_agent_other_than(me))
-        .map(|agent| AgentSample { status: agent.status(), cwd: agent.cwd })
+        .map(|agent| {
+            (agent.pane_id.clone(), AgentSample { status: agent.status(), cwd: agent.cwd })
+        })
         .collect()
 }
 
-/// The real agents in workspace `ws`, ignoring our own pane `me`. Only entries carrying an
-/// `agent` field count. herdr 0.7.5 already keeps non-agent panes
-/// out of `agent list`, so both filters are defensive: a reviewr pane or a plain shell shows
-/// up in `pane list` without an `agent` key and never here (`../docs/herdr-api-notes.md`).
+/// The real agents in workspace `ws`, our own pane `me` excluded.
 fn candidates<'a>(
     agents: &'a [AgentPane],
     ws: Option<&str>,
@@ -429,27 +602,294 @@ fn candidates<'a>(
         .collect()
 }
 
-/// Write literal text into the agent pane's input, without submitting.
-///
-/// Uses `pane send-text`, not the agent-level send: herdr 0.7.5 replaced `agent send` with
-/// the logical-key `agent send-keys`, while `pane send-text` has carried the literal-text,
-/// no-Enter semantics unchanged since 0.7.0 (`docs/herdr-api-notes.md`).
-pub fn send_text(pane: &str, text: &str) -> Result<()> {
-    herdr(&["pane", "send-text", pane, &pasted(text)])?;
-    Ok(())
+/// Refuse a send to an agent at a prompt, read fresh; herdr offers no atomic send-if-ready.
+fn ensure_ready(pane: &str) -> Result<(), SendError> {
+    readiness_in(&agent_list()?, pane)?;
+    // Dialog key hints sit at the foot of the screen. A read herdr cannot answer does not block.
+    match call(&["pane", "read", pane, "--source", "visible"]) {
+        Ok(screen) if shows_dialog_hint(&screen) => Err(SendError::Dialog),
+        Ok(_) => Ok(()),
+        Err(error) => {
+            logln!("pane read {pane} failed, not blocking the send: {error}");
+            Ok(())
+        }
+    }
 }
 
+/// Only an agent at a prompt refuses, since a prompt drops a paste; one no longer listed is gone.
+fn readiness_in(agents: &[AgentPane], pane: &str) -> Result<(), SendError> {
+    match agents.iter().find(|agent| agent.pane_id == pane && agent.agent.is_some()) {
+        None => {
+            logln!("agent pane {pane} is gone");
+            Err(HerdrError::PaneGone.into())
+        }
+        Some(agent) if agent.status() == Status::Blocked => {
+            Err(SendError::AtPrompt(agent.row_name()))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// The largest request a send writes, escaping included: what herdr reads in time on every OS.
+const MAX_REQUEST_BYTES: usize = 256 * 1024;
+
+/// How long a send waits for herdr's reply: its 5 s read window plus the answer.
+const SEND_BOUND: Duration = Duration::from_secs(5).saturating_add(ANSWER_BOUND);
+
+/// Paste literal text into the agent pane's input, unsubmitted, in one socket request.
+pub fn send_text(pane: &str, text: &str) -> Result<(), SendError> {
+    ensure_ready(pane)?;
+    send_past_ready(pane, text)
+}
+
+/// Paste `text` once readiness is already decided, so a framing keypress can land first.
+fn send_past_ready(pane: &str, text: &str) -> Result<(), SendError> {
+    let Some(socket) = var_os("HERDR_SOCKET_PATH") else {
+        logln!("no HERDR_SOCKET_PATH to send through");
+        return Err(HerdrError::Unanswered.into());
+    };
+    let request = serde_json::json!({
+        "id": "reviewr:send",
+        "method": "pane.send_text",
+        "params": {"pane_id": pane, "text": pasted(text)},
+    })
+    .to_string();
+    if request.len() > MAX_REQUEST_BYTES {
+        return Err(SendError::TooLarge);
+    }
+    Ok(socket_call(socket, request)?)
+}
+
+/// One request line answered by one reply line, on its own thread, bounded by [`SEND_BOUND`].
+fn socket_call(socket: OsString, request: String) -> Result<(), HerdrError> {
+    reply_outcome(&socket_exchange(socket, request, SEND_BOUND)?)
+}
+
+/// One request answered by one reply, read as `T`; herdr's error code becomes `Refused`.
+pub(crate) fn socket_request<T: serde::de::DeserializeOwned>(
+    socket: OsString,
+    method: &str,
+    bound: Duration,
+) -> Result<T, HerdrError> {
+    let request = serde_json::json!({ "id": method, "method": method, "params": {} });
+    let reply = socket_exchange(socket, request.to_string(), bound)?;
+    if let Some(code) = error_code(&reply) {
+        return Err(HerdrError::refused(Some(code)));
+    }
+    answer(&reply)
+}
+
+/// Write `request` and read herdr's one reply line, on its own thread, within `bound`: a pipe's
+/// read timeout may be unsupported, so the thread is what bounds it.
+pub(crate) fn socket_exchange(
+    socket: OsString,
+    request: String,
+    bound: Duration,
+) -> Result<String, HerdrError> {
+    let (tx, rx) = mpsc::channel();
+    let deadline = Instant::now() + bound;
+    thread::spawn(move || {
+        let _ = tx.send(socket::exchange(&socket, &request, deadline));
+    });
+    match rx.recv_timeout(bound) {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(error)) => {
+            logln!("herdr socket call failed: {error}");
+            Err(HerdrError::Unanswered)
+        }
+        Err(_) => {
+            logln!("herdr socket call unanswered after {bound:?}");
+            Err(HerdrError::Unanswered)
+        }
+    }
+}
+
+/// A `result` reply is success; an error envelope is a refusal carrying its code.
+fn reply_outcome(reply: &str) -> Result<(), HerdrError> {
+    if let Some(code) = error_code(reply) {
+        logln!("herdr refused over the socket: {}", reply.trim());
+        return Err(HerdrError::refused(Some(code)));
+    }
+    answer::<serde::de::IgnoredAny>(reply).map(drop)
+}
+
+/// The socket transport: a Unix socket, or a named pipe on Windows; one request per connection.
+pub(crate) mod socket {
+    use std::ffi::OsStr;
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Write `request` as one line and read the one line herdr answers.
+    pub(super) fn exchange(socket: &OsStr, request: &str, deadline: Instant) -> io::Result<String> {
+        let mut stream = connect(socket, deadline)?;
+        stream.write_all(request.as_bytes())?;
+        stream.write_all(b"\n")?;
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply)?;
+        if !reply.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "herdr closed the connection without answering",
+            ));
+        }
+        Ok(reply)
+    }
+
+    /// The time left before `deadline`, or a timeout once none is.
+    fn left(deadline: Instant) -> io::Result<Duration> {
+        Some(deadline.saturating_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "herdr did not answer in time"))
+    }
+
+    /// One `events.subscribe` connection: a reader thread forwards its lines, the acknowledgment
+    /// first; dropping it unblocks that reader and closes the connection.
+    pub(crate) struct Subscription {
+        stream: Arc<Stream>,
+        /// Set before unblocking, so a reader between reads stops instead of reading again.
+        closed: Arc<AtomicBool>,
+        reader: std::thread::JoinHandle<()>,
+    }
+
+    /// What a subscription's reader forwards.
+    #[derive(Debug)]
+    pub(crate) enum Line {
+        /// One line, without its newline.
+        Text(Vec<u8>),
+        /// The connection closed or failed; nothing follows.
+        Closed(String),
+    }
+
+    #[cfg(unix)]
+    type Stream = std::os::unix::net::UnixStream;
+    #[cfg(windows)]
+    type Stream = interprocess::local_socket::Stream;
+
+    impl Subscription {
+        /// Connect, write `request`, and hand every line read to `sink`, which says whether anyone
+        /// still listens.
+        pub(crate) fn open(
+            socket: &OsStr,
+            request: &str,
+            deadline: Instant,
+            sink: impl Fn(Line) -> bool + Send + 'static,
+        ) -> io::Result<Self> {
+            let mut stream = connect(socket, deadline)?;
+            stream.write_all(request.as_bytes())?;
+            stream.write_all(b"\n")?;
+            #[cfg(unix)]
+            stream.set_read_timeout(None)?;
+            let stream = Arc::new(stream);
+            let closed = Arc::new(AtomicBool::new(false));
+            let (theirs, their_closed) = (Arc::clone(&stream), Arc::clone(&closed));
+            let reader = std::thread::Builder::new()
+                .name("herdr-subscription".into())
+                .spawn(move || forward(&theirs, &their_closed, &sink))?;
+            Ok(Self { stream, closed, reader })
+        }
+    }
+
+    impl Drop for Subscription {
+        /// Unblock the reader until it returns: a cancel lands only on a read already pending,
+        /// so it repeats, bounded, for a reader that was between reads.
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+            for _ in 0..1000 {
+                #[cfg(unix)]
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                #[cfg(windows)]
+                cancel(&self.stream);
+                if self.reader.is_finished() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            crate::logln!("herdr subscription reader did not stop");
+        }
+    }
+
+    /// Read `stream` until it closes or `closed` is set, forwarding each complete line.
+    fn forward(stream: &Stream, closed: &AtomicBool, sink: &impl Fn(Line) -> bool) {
+        use std::io::Read;
+        let mut pending = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let ended = loop {
+            if closed.load(Ordering::SeqCst) {
+                return;
+            }
+            match (&*stream).read(&mut chunk) {
+                Ok(0) => break "herdr closed the subscription".to_owned(),
+                Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => break e.to_string(),
+            }
+            while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = pending.drain(..=end).collect();
+                line.pop();
+                if !sink(Line::Text(line)) {
+                    return;
+                }
+            }
+        };
+        if !closed.load(Ordering::SeqCst) {
+            sink(Line::Closed(ended));
+        }
+    }
+
+    /// The handle the stream's reads go through: a duplicate would not cancel them.
+    #[cfg(windows)]
+    fn raw_handle(stream: &Stream) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        let Stream::NamedPipe(pipe) = stream;
+        pipe.as_handle().as_raw_handle()
+    }
+
+    /// Cancel the reads pending on `stream`'s own handle, so the reader thread returns.
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn cancel(stream: &Stream) {
+        use windows_sys::Win32::System::IO::CancelIoEx;
+        // SAFETY: the handle stays open while the subscription holds its stream.
+        unsafe { CancelIoEx(raw_handle(stream).cast(), std::ptr::null()) };
+    }
+
+    /// Timeouts set once at connect: macOS fails `setsockopt` once herdr has closed.
+    #[cfg(unix)]
+    fn connect(socket: &OsStr, deadline: Instant) -> io::Result<std::os::unix::net::UnixStream> {
+        let stream = std::os::unix::net::UnixStream::connect(socket)?;
+        let left = left(deadline)?;
+        stream.set_read_timeout(Some(left))?;
+        stream.set_write_timeout(Some(left))?;
+        Ok(stream)
+    }
+
+    /// Wait for a free pipe instance only until the deadline, as herdr's own client does.
+    #[cfg(windows)]
+    fn connect(
+        socket: &OsStr,
+        deadline: Instant,
+    ) -> io::Result<interprocess::local_socket::Stream> {
+        use interprocess::ConnectWaitMode;
+        use interprocess::local_socket::{ConnectOptions, GenericNamespaced, prelude::*};
+        let name = socket.to_string_lossy().into_owned().to_ns_name::<GenericNamespaced>()?;
+        ConnectOptions::new()
+            .name(name)
+            .wait_mode(ConnectWaitMode::Timeout(left(deadline)?))
+            .connect_sync()
+    }
+}
+
+/// The bracketed-paste markers.
 const PASTE_START: &str = "\x1b[200~";
 const PASTE_END: &str = "\x1b[201~";
 
-/// The batch as one bracketed paste event, never raw bytes: a paste inserts verbatim in any
-/// input mode, where raw bytes execute as commands in a vim-style input resting in normal
-/// mode. A terminator inside the batch would end the frame early and
-/// hand the tail to the command interpreter. The body is rebuilt with a suffix check per
-/// character, so a terminator never survives, not even one spliced together by an earlier
-/// removal — and the send stays linear, where a delete-and-rescan loop is quadratic on
-/// splice-heavy input and stalls the frame loop mid-send.
+/// The batch as one bracketed paste, line breaks as herdr's own paste encodes them on this OS,
+/// every inner terminator stripped in one pass.
 fn pasted(text: &str) -> String {
+    let text: std::borrow::Cow<'_, str> =
+        if cfg!(windows) { crate::text::crlf_line_breaks(text).into() } else { text.into() };
     let mut body = String::with_capacity(text.len());
     for ch in text.chars() {
         body.push(ch);
@@ -460,15 +900,12 @@ fn pasted(text: &str) -> String {
     format!("{PASTE_START}{body}{PASTE_END}")
 }
 
-/// Why a chosen agent cannot take text right now. Every send checks this first and writes
-/// nothing when it holds (issue #86): typed into a confirmation or a picker, the text would
-/// answer the dialog instead of landing in the input box.
+/// Why a chosen agent cannot take text right now. A send writes nothing while this holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotReady {
     /// herdr reports the agent `blocked`: it is waiting on a permission or confirmation.
     Blocked,
-    /// The pane's screen shows a dialog's key hints. Codex keeps reporting `working` or
-    /// `idle` under its model picker, so the screen is the only witness there.
+    /// The pane's screen shows a dialog's key hints. Codex reports `idle` under its model picker.
     Dialog,
 }
 
@@ -486,47 +923,22 @@ impl NotReady {
 /// hints sit at its foot, which is the foot of the screen.
 const DIALOG_HINT_LINES: usize = 8;
 
-/// Whether `pane` can take text now: not `blocked`, and no dialog hint on its visible screen.
-/// `working` is ready — both agents take typing into the input box mid-turn. A check herdr
-/// cannot answer does not block: it logs, and the send goes ahead as it did before the check.
+/// Whether `pane` can take text now. `working` is ready. A check herdr cannot answer does not block.
 pub fn target_ready(pane: &str) -> Result<(), NotReady> {
-    match herdr(&["agent", "get", pane]).and_then(|json| parse_agent_status(&json)) {
-        Ok(status) if Status::from_wire(&status) == Status::Blocked => {
-            return Err(NotReady::Blocked);
+    match ensure_ready(pane) {
+        Ok(()) => Ok(()),
+        Err(SendError::AtPrompt(_)) => Err(NotReady::Blocked),
+        Err(SendError::Dialog) => Err(NotReady::Dialog),
+        // A check herdr cannot answer does not block: the send goes ahead.
+        Err(error) => {
+            logln!("readiness check for {pane} failed, not blocking the send: {error}");
+            Ok(())
         }
-        Ok(_) => {}
-        Err(e) => logln!("agent get {pane} unreadable, not blocking the send: {e:#}"),
     }
-    match herdr(&["pane", "read", pane, "--source", "visible"]) {
-        Ok(screen) if shows_dialog_hint(&screen) => return Err(NotReady::Dialog),
-        Ok(_) => {}
-        Err(e) => logln!("pane read {pane} failed, not blocking the send: {e:#}"),
-    }
-    Ok(())
 }
 
-/// The `agent_status` of the one agent in an `agent get` envelope.
-fn parse_agent_status(json: &str) -> Result<String> {
-    #[derive(Deserialize)]
-    struct Response {
-        result: Get,
-    }
-    #[derive(Deserialize)]
-    struct Get {
-        agent: Entry,
-    }
-    #[derive(Deserialize)]
-    struct Entry {
-        agent_status: String,
-    }
-    let response: Response = serde_json::from_str(json).context("parsing agent get")?;
-    Ok(response.result.agent.agent_status)
-}
-
-/// Whether one of the screen's last [`DIALOG_HINT_LINES`] non-empty lines carries a dialog's
-/// key hints: the whole words `enter` and `esc` on the same line, in either order
-/// (`Enter to confirm · Esc to cancel`, `enter select · esc back`). `esc` alone is the working
-/// spinner's `esc to interrupt`, and never counts.
+/// Whether one of the last [`DIALOG_HINT_LINES`] non-empty lines has both `enter` and `esc`.
+/// `esc` alone is the working spinner's `esc to interrupt`, and never counts.
 fn shows_dialog_hint(screen: &str) -> bool {
     let lines: Vec<&str> = screen.lines().filter(|line| !line.trim().is_empty()).collect();
     lines[lines.len().saturating_sub(DIALOG_HINT_LINES)..].iter().any(|line| {
@@ -536,29 +948,29 @@ fn shows_dialog_hint(screen: &str) -> bool {
     })
 }
 
-/// Drop one comment into the agent's input box on a line of its own: a newline, the text as a
-/// bracketed paste, and a newline after it so the reviewer keeps typing below. `ctrl+j` is a
-/// newline, never a submit, in the Claude Code and Codex input boxes, and nothing here presses
-/// Enter or moves focus. A failure before the text lands writes nothing a retry would repeat;
-/// once the text is in, a failed closing newline only logs, or a retry would paste it twice.
-pub fn deliver_quote(pane: &str, text: &str) -> Result<()> {
-    herdr(&["pane", "send-keys", pane, "ctrl+j"])?;
-    send_text(pane, text)?;
-    if let Err(e) = herdr(&["pane", "send-keys", pane, "ctrl+j"]) {
-        logln!("closing newline to {pane} failed after the text landed: {e:#}");
+/// Paste one comment between two `ctrl+j` newlines, unsent and unfocused.
+/// A failed closing newline only logs: the text already landed, and a retry would paste it twice.
+pub fn deliver_quote(pane: &str, text: &str) -> Result<(), SendError> {
+    ensure_ready(pane)?;
+    // `ctrl+j` is a newline, never a submit. A failure before the paste writes nothing to retry.
+    call(&["pane", "send-keys", pane, "ctrl+j"])?;
+    send_past_ready(pane, text)?;
+    if let Err(error) = call(&["pane", "send-keys", pane, "ctrl+j"]) {
+        logln!("closing newline to {pane} failed after the text landed: {error}");
     }
     Ok(())
 }
 
 /// Focus the agent pane so the reviewer can add context and submit.
-pub fn focus(pane: &str) -> Result<()> {
-    herdr(&["agent", "focus", pane])?;
-    Ok(())
+pub fn focus(pane: &str) -> Result<(), HerdrError> {
+    call(&["agent", "focus", pane]).map(drop)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentChoice, AgentPane, HashMap, Status, parse_agents, parse_tab_labels};
+    use super::{
+        AgentChoice, AgentPane, HashMap, HerdrError, Status, parse_agents, parse_tab_labels,
+    };
 
     /// One agent entry shaped like the real `herdr agent list` output (api notes).
     fn agent(pane: &str, tab: &str, ws: &str) -> AgentPane {
@@ -572,8 +984,7 @@ mod tests {
         }
     }
 
-    /// One non-agent pane as herdr 0.7.1 lists it live: `agent_status: unknown`, no `agent`
-    /// field — a reviewr pane or a plain shell.
+    /// A non-agent pane as herdr lists it: `agent_status: unknown`, no `agent`.
     fn non_agent_pane(pane: &str, tab: &str, ws: &str) -> AgentPane {
         AgentPane {
             agent: None,
@@ -596,17 +1007,57 @@ mod tests {
     }
 
     #[test]
+    fn a_send_refuses_only_an_agent_at_a_prompt() {
+        let at = |status: &str| AgentPane {
+            agent_status: status.into(),
+            state_labels: Some(HashMap::from([("compacting".into(), "Compacting".into())])),
+            ..agent("w8:p1", "w8:t1", "w8")
+        };
+        // A working agent takes typing mid-turn: the paste waits in its input.
+        for status in ["idle", "done", "working", "unknown", "compacting"] {
+            assert_eq!(super::readiness_in(&[at(status)], "w8:p1"), Ok(()), "{status}");
+        }
+        // A prompt drops a paste.
+        let blocked = super::readiness_in(&[at("blocked")], "w8:p1");
+        assert_eq!(blocked, Err(super::SendError::AtPrompt("claude".into())));
+        let gone = Err(super::SendError::Herdr(HerdrError::PaneGone));
+        assert_eq!(super::readiness_in(&[at("idle")], "w8:p9"), gone);
+        // A pane whose agent exited is listed without one: the send goes nowhere near it.
+        let shell = AgentPane { agent: None, ..at("idle") };
+        assert_eq!(super::readiness_in(&[shell], "w8:p1"), gone);
+    }
+
+    #[test]
+    fn an_agent_entry_herdr_shaped_unexpectedly_is_set_aside_by_its_cwd() {
+        let list = serde_json::json!([
+            {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1",
+             "agent_status": "working", "agent": "claude", "cwd": "/w"},
+            {"pane_id": "w2:p1", "agent": "codex", "tab_id": null, "cwd": "/elsewhere"},
+            {"pane_id": "w2:p2", "agent": "codex"},
+            {"pane_id": "w2:p3", "tab_id": null, "cwd": "/w"},
+            {"pane_id": "w2:p4", "agent": {"name": "codex"}, "cwd": "/reshaped"},
+            {"pane_id": "w1:p9", "agent": "claude", "tab_id": null},
+        ]);
+        let sampled = super::samples_of(&list, Some("w1:p9")).expect("a list");
+        assert_eq!(sampled.agents.len(), 1, "the readable agent still counts");
+        let odd = [Some("/elsewhere".to_string()), None, Some("/reshaped".to_string())];
+        assert_eq!(
+            sampled.odd, odd,
+            "a shell pane and our own pane are no agents, a reshaped one is"
+        );
+        assert_eq!(super::samples_of(&serde_json::Value::Null, None), None, "no list is no answer");
+    }
+
+    #[test]
     fn sampling_keeps_every_tab_and_workspace() {
-        // Turn tracking asks where an agent works, never where its pane sits, so neither the
-        // reviewr pane's tab nor its workspace narrows the sample (HH-TURN-PER-WORKTREE).
-        // This is what makes the `tab` placement track exactly like `split`.
+        // Membership rides the agent's cwd, never its pane's tab or workspace.
         let agents = vec![
             AgentPane { cwd: Some("/w/one".into()), ..agent("w8:p1", "w8:t1", "w8") },
             AgentPane { cwd: Some("/w/two".into()), ..agent("w8:p2", "w8:t2", "w8") },
             AgentPane { cwd: Some("/w/three".into()), ..agent("w9:p1", "w9:t1", "w9") },
         ];
         let cwds: Vec<_> =
-            super::samples_of(agents, None).into_iter().filter_map(|s| s.cwd).collect();
+            super::samples_among(agents, None).into_iter().filter_map(|(_, s)| s.cwd).collect();
         assert_eq!(cwds, ["/w/one", "/w/two", "/w/three"]);
     }
 
@@ -617,9 +1068,10 @@ mod tests {
             AgentPane { cwd: Some("/w/shell".into()), ..non_agent_pane("w3:p4", "w3:t1", "w3") },
             AgentPane { cwd: Some("/w/self".into()), ..agent("w3:p5", "w3:t1", "w3") },
         ];
-        let cwds: Vec<_> =
-            super::samples_of(agents, Some("w3:p5")).into_iter().filter_map(|s| s.cwd).collect();
-        assert_eq!(cwds, ["/w/real"]);
+        let samples = super::samples_among(agents, Some("w3:p5"));
+        let panes: Vec<_> =
+            samples.iter().map(|(pane, s)| (pane.as_str(), s.cwd.as_deref())).collect();
+        assert_eq!(panes, [("w3:p1", Some("/w/real"))]);
     }
 
     #[test]
@@ -629,7 +1081,8 @@ mod tests {
             cwd: Some("/w/one".into()),
             ..agent("w8:p1", "w8:t1", "w8")
         }];
-        assert_eq!(super::samples_of(agents, None)[0].status, Status::Blocked);
+        let samples = super::samples_among(agents, None);
+        assert_eq!(samples[0].1.status, Status::Blocked);
     }
 
     /// One agent carrying the picker-facing fields herdr omits until something sets them.
@@ -653,6 +1106,9 @@ mod tests {
             ..agent("w8:p1", "w8:t1", "w8")
         };
         assert_eq!(displayed.row_name(), "Claude");
+        // An empty name parses as no name, so it falls through too.
+        let emptied = r#"{"result":{"agents":[{"agent":"codex","agent_status":"idle","pane_id":"w8:p2","tab_id":"w8:t1","workspace_id":"w8","name":"","display_agent":""}]}}"#;
+        assert_eq!(super::parse_agents(emptied).unwrap()[0].row_name(), "codex");
     }
 
     #[test]
@@ -723,6 +1179,31 @@ mod tests {
         assert_eq!(parse_agents(cleared).unwrap()[0].row_name(), "codex");
     }
 
+    /// A herdr that accepts and never answers holds the exchange only until its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn an_unanswered_exchange_ends_at_its_deadline() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let held = listener.accept();
+            let _ = released.recv();
+            drop(held);
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        std::thread::spawn(move || {
+            let _ = tx.send(super::socket::exchange(path.as_os_str(), "{}", deadline));
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5)).expect("the exchange ends");
+        let kind = outcome.expect_err("no reply came").kind();
+        assert!(matches!(kind, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        drop(release);
+    }
+
     #[test]
     fn a_dialog_hint_needs_both_enter_and_esc_as_words_on_one_line() {
         use super::shows_dialog_hint as hint;
@@ -748,40 +1229,63 @@ mod tests {
     }
 
     #[test]
-    fn agent_get_reads_the_status_of_its_one_agent() {
-        // The live 0.9.1 envelope, trimmed: `result.agent`, not `result.agents`.
-        let json = r#"{"id":"cli:agent:get","result":{"agent":{"agent":"claude","agent_status":"blocked","pane_id":"w6:p1"},"type":"agent_info"}}"#;
-        assert_eq!(super::parse_agent_status(json).unwrap(), "blocked");
-        assert!(super::parse_agent_status("").is_err());
+    fn only_a_result_reply_is_a_delivered_send() {
+        let ok = "{\"id\":\"reviewr:send\",\"result\":{\"type\":\"ok\"}}\n";
+        assert_eq!(super::reply_outcome(ok), Ok(()));
+        // herdr's error reply echoes the id and carries the same envelope as a failed CLI call.
+        let gone = r#"{"id":"reviewr:send","error":{"code":"pane_not_found","message":"pane w8:p1 not found"}}"#;
+        assert_eq!(super::reply_outcome(gone), Err(HerdrError::PaneGone));
+        assert_eq!(super::reply_outcome(r#"{"id":"reviewr:send"}"#), Err(HerdrError::Unreadable));
     }
 
     #[test]
-    fn a_send_wraps_the_batch_in_one_bracketed_paste_frame() {
+    fn a_send_is_one_bracketed_paste_no_embedded_terminator_can_end() {
         // Issue #41's repro string: sent raw, vim ate the leading `b` and `i`.
-        assert_eq!(
-            super::pasted("bit/DESIGN.md:95 note"),
-            "\x1b[200~bit/DESIGN.md:95 note\x1b[201~"
-        );
-    }
-
-    #[test]
-    fn an_embedded_paste_terminator_cannot_end_the_frame_early() {
-        // A diff snippet is raw file content and can carry the terminator. The second
-        // input splices one together across a removal.
+        let note = "bit/DESIGN.md:95 note";
+        assert_eq!(super::pasted(note), "\x1b[200~bit/DESIGN.md:95 note\x1b[201~");
+        // A snippet can carry the terminator, even spliced across a removal.
         assert_eq!(super::pasted("a\x1b[201~b"), "\x1b[200~ab\x1b[201~");
         assert_eq!(super::pasted("a\x1b[201\x1b[201~~b"), "\x1b[200~ab\x1b[201~");
     }
 
     #[test]
     fn a_pane_label_reads_only_our_pane_and_absent_or_empty_is_none() {
-        // The live `pane list` entry shape (docs/herdr-api-notes.md): `label` appears only
-        // on labeled panes. The label logic stamps the unlabeled and clears only its own.
+        // `label` appears only on labelled panes.
         let json = r#"{"result":{"panes":[{"pane_id":"w1:p1","label":"build"},{"pane_id":"w1:p2"},{"pane_id":"w1:p3","label":""}]}}"#;
-        assert_eq!(super::parse_pane_label(json, "w1:p1").as_deref(), Some("build"));
-        assert_eq!(super::parse_pane_label(json, "w1:p2"), None);
-        assert_eq!(super::parse_pane_label(json, "w1:p3"), None, "empty label reads as none");
-        assert_eq!(super::parse_pane_label(json, "w9:p9"), None, "unknown pane reads as none");
-        assert_eq!(super::parse_pane_label("[]", "w1:p1"), None, "junk envelope reads as none");
+        let list: super::PaneList = super::answer(json).unwrap();
+        let label = |pane: &str| list.pane(pane).and_then(|p| p.label.as_deref());
+        assert_eq!(label("w1:p1"), Some("build"));
+        assert_eq!(label("w1:p2"), None);
+        assert_eq!(label("w1:p3"), None, "empty label reads as none");
+        assert_eq!(label("w9:p9"), None, "unknown pane reads as none");
+    }
+
+    #[test]
+    fn a_herdr_answer_missing_its_shape_is_unreadable_never_empty() {
+        // An error envelope with exit 0 is a shape failure, never an empty listing.
+        let envelope = r#"{"error":{"code":"internal","message":"boom"},"id":"cli:request"}"#;
+        assert_eq!(super::answer::<super::PaneList>(envelope).err(), Some(HerdrError::Unreadable));
+        assert_eq!(super::ProcessInfo::parse(envelope).err(), Some(HerdrError::Unreadable));
+        // herdr skips an empty `foreground_processes`: zero processes, a real answer.
+        let bare = r#"{"result":{"process_info":{"pane_id":"w1:p1","shell_pid":7}}}"#;
+        assert_eq!(super::ProcessInfo::parse(bare).unwrap().foreground_processes.len(), 0);
+    }
+
+    #[test]
+    fn a_failed_call_carries_herdrs_error_code() {
+        // The code tells a pane that exited mid-sweep from a herdr that failed.
+        let gone = r#"{"error":{"code":"pane_not_found","message":"pane w1:p3 not found"},"id":"cli:request"}"#;
+        assert_eq!(super::error_code(gone).as_deref(), Some("pane_not_found"));
+        assert_eq!(HerdrError::refused(super::error_code(gone)), HerdrError::PaneGone);
+        // An advisory line before the envelope does not hide it.
+        let noisy = format!("warning: something\n{gone}\n");
+        assert_eq!(super::error_code(&noisy).as_deref(), Some("pane_not_found"));
+        let internal = r#"{"error":{"code":"internal","message":"boom"}}"#;
+        assert_eq!(
+            HerdrError::refused(super::error_code(internal)),
+            HerdrError::Refused(Some("internal".into()))
+        );
+        assert_eq!(super::error_code("plain words"), None);
     }
 
     #[test]
@@ -796,8 +1300,7 @@ mod tests {
 
     #[test]
     fn parse_agents_accepts_only_the_documented_envelope() {
-        // `cwd` is asserted from the wire on purpose: it is the one field worktree
-        // membership rides on, so a renamed key must fail here, not silently in production.
+        // `cwd` from the wire: worktree membership rides on it.
         let wrapped = r#"{"result":{"agents":[{"agent":"claude","agent_status":"working","pane_id":"w8:p1","tab_id":"w8:t1","workspace_id":"w8","cwd":"/w/one"}]}}"#;
         assert_eq!(
             parse_agents(wrapped).unwrap(),
@@ -812,8 +1315,7 @@ mod tests {
         let parsed = parse_agents(bare).unwrap();
         assert_eq!(parsed[0].row_state(), "compacting", "the row shows herdr's own spelling");
         assert_eq!(parsed[0].status(), Status::Unknown, "tracking folds it to unknown");
-        // And the spelling is the `state_labels` key, so herdr can label a state reviewr has
-        // never heard of.
+        // The spelling is the `state_labels` key.
         let labelled = r#"{"result":{"agents":[{"agent":"claude","agent_status":"compacting","pane_id":"w8:p1","tab_id":"w8:t1","workspace_id":"w8","state_labels":{"compacting":"Compacting"}}]}}"#;
         assert_eq!(parse_agents(labelled).unwrap()[0].row_state(), "Compacting");
     }

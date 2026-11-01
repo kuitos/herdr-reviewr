@@ -1,13 +1,7 @@
-//! Formatting comments and exporting them to the agent or clipboard.
-//!
-//! A comment becomes a block of `location` (with its quoted span, when it
-//! has one), the diff snippet, then the text. Export is consume-on-success: the caller removes
-//! a comment only after `export` returns `Ok`.
+//! Comments formatted as location (and a quote), snippet, text, and exported; consume on `Ok`.
+//! A review prefix heads every batch and every immediate-delivery quote.
 
-use std::io::Write;
-use std::process::Stdio;
-
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
 use crate::herdr;
 use crate::model::Comment;
@@ -18,11 +12,8 @@ pub fn format_comment(comment: &Comment) -> String {
     format!("{}\n{}\n{}", comment.heading(), comment.lines, normalize_text(&comment.text))
 }
 
-/// One comment as the quote an immediate delivery drops into the agent's input box, the shape
-/// a reply quote takes in a chat composer: the quoted span on one `> ` line after its location
-/// (`> path:3「text」`), or, for a comment on whole lines, the location and then each snippet
-/// line behind its own `> `, markers kept. The comment text follows on the next line, its
-/// line breaks kept.
+/// One comment as the quote an immediate delivery pastes: `> path:3「text」`, or each snippet
+/// line behind `> `, then the comment text with its line breaks kept.
 pub fn format_quote(comment: &Comment) -> String {
     let quote = match comment.quote_label() {
         Some(label) => format!("> {}「{label}」", comment.location()),
@@ -35,8 +26,7 @@ pub fn format_quote(comment: &Comment) -> String {
     format!("{quote}\n{}", normalize_text(&comment.text))
 }
 
-/// Comment text for export: drop `\r`, trim trailing space per line, and drop blank
-/// lines so a multi-line comment can never introduce the blank-line block separator.
+/// Comment text without blank lines, which would read as the separator between comments.
 fn normalize_text(text: &str) -> String {
     text.replace('\r', "")
         .lines()
@@ -46,55 +36,77 @@ fn normalize_text(text: &str) -> String {
         .join("\n")
 }
 
-/// Many comments, sorted by file then start line, one blank line between blocks.
-pub fn format_all(comments: &[&Comment]) -> String {
-    sorted(comments).iter().map(|c| format_comment(c)).collect::<Vec<_>>().join("\n\n")
-}
-
-/// Many comments as consecutive quotes, sorted like `format_all`: what `send` delivers under
-/// `deliver = "immediate"`, so the comments left over from a refused delivery land in the same
-/// shape as the ones that went out on save.
+/// Many comments as consecutive quotes, sorted by file then start line. What `send` delivers
+/// under `deliver = "immediate"`, so leftovers land in the same shape as each save.
 pub fn format_all_quotes(comments: &[&Comment]) -> String {
-    sorted(comments).iter().map(|c| format_quote(c)).collect::<Vec<_>>().join("\n")
-}
-
-fn sorted<'a>(comments: &[&'a Comment]) -> Vec<&'a Comment> {
     let mut sorted = comments.to_vec();
     sorted.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
-    sorted
+    sorted.iter().map(|c| format_quote(c)).collect::<Vec<_>>().join("\n")
+}
+
+/// [`format_all_quotes`] with the trimmed review prefix above the quotes.
+pub fn format_quotes(prefix: Option<&str>, comments: &[&Comment]) -> String {
+    let body = format_all_quotes(comments);
+    let prefix = prefix
+        .map(|text| text.replace('\r', "").trim_end().to_owned())
+        .filter(|text| !text.is_empty());
+    match prefix {
+        Some(prefix) if !body.is_empty() => format!("{prefix}\n\n{body}"),
+        Some(prefix) => prefix,
+        None => body,
+    }
+}
+
+/// The exported review: the trimmed prefix, then comments by file and start line, a blank line between.
+pub fn format_review(prefix: Option<&str>, comments: &[&Comment]) -> String {
+    let mut sorted = comments.to_vec();
+    sorted.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
+    let prefix = prefix
+        .map(|text| text.replace('\r', "").trim_end().to_owned())
+        .filter(|text| !text.is_empty());
+    prefix
+        .into_iter()
+        .chain(sorted.iter().map(|c| format_comment(c)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// A destination comments can be exported to. Export succeeds or errors as a whole.
 pub trait ExportTarget {
     fn export(&self, text: &str) -> Result<()>;
-    /// The text this destination receives for `comments`.
-    fn format(&self, comments: &[&Comment]) -> String {
-        format_all(comments)
+    /// The text this destination receives for `comments`, the review prefix above it.
+    fn format(&self, prefix: Option<&str>, comments: &[&Comment]) -> String {
+        format_review(prefix, comments)
     }
     fn label(&self) -> &'static str;
     /// Destination-specific confirmation shown after a successful export.
     fn success_message(&self, count: usize) -> String;
-    /// Destination-specific line shown after a failed one. It is the whole status, so it is one
-    /// short sentence a reviewer can read, never the underlying error. The cause goes to the log.
-    fn failure_message(&self) -> String;
+    /// The status after a failed export, `copy` naming the copy key; the cause goes to the log.
+    fn failure_message(&self, error: &anyhow::Error, copy: &str) -> String;
 }
 
-fn counted_comments(count: usize) -> String {
+/// The status for a failed send to `agent`: the cause first, since a narrow pane keeps only the
+/// line's start, then the way out.
+pub fn send_failure(error: &herdr::SendError, agent: Option<&str>, copy: &str) -> String {
+    use herdr::{HerdrError as H, SendError as S};
+    let cause = match error {
+        S::AtPrompt(name) => return format!("answer {name}'s prompt first"),
+        S::Dialog => return "agent has a dialog open".to_string(),
+        S::Herdr(H::PaneGone) => format!("{} closed", agent.unwrap_or("the agent")),
+        S::NoAgent => "no agent in this workspace".to_string(),
+        S::TooLarge => "review too large to send".to_string(),
+        S::Herdr(H::Unanswered) => "herdr didn't answer".to_string(),
+        S::Herdr(H::Refused(_) | H::Unreadable) => "herdr refused the send".to_string(),
+    };
+    format!("{cause}, press {copy} to copy")
+}
+
+pub(crate) fn counted_comments(count: usize) -> String {
     let noun = if count == 1 { "comment" } else { "comments" };
     format!("{count} {noun}")
 }
 
-/// A clipboard tool and the args that make it read stdin into the system clipboard. Tried in
-/// order — the first one present on `PATH` wins. macOS ships `pbcopy`; Linux needs one of these
-/// installed (Wayland `wl-copy`, or X11 `xclip`/`xsel`). OSC 52 and Windows are roadmap.
-const CLIPBOARD_TOOLS: &[(&str, &[&str])] = &[
-    ("pbcopy", &[]),
-    ("wl-copy", &[]),
-    ("xclip", &["-selection", "clipboard"]),
-    ("xsel", &["--clipboard", "--input"]),
-];
-
-/// The system clipboard, via the first available platform clipboard tool.
+/// The system clipboard: the first tool on `PATH`, or the Win32 clipboard on Windows.
 #[derive(Debug)]
 pub struct Clipboard;
 
@@ -107,15 +119,53 @@ impl ExportTarget for Clipboard {
         format!("copied {}", counted_comments(count))
     }
 
-    fn failure_message(&self) -> String {
-        "clipboard failed".to_string()
+    fn failure_message(&self, error: &anyhow::Error, _copy: &str) -> String {
+        match clipboard::remedy(error) {
+            Some(remedy) => format!("copy failed: {remedy}"),
+            None => "copy failed".to_string(),
+        }
     }
 
     fn export(&self, text: &str) -> Result<()> {
-        let (cmd, args) = select_tool(CLIPBOARD_TOOLS, crate::proc::on_path).context(
-            "no clipboard tool found (install wl-clipboard, xclip, or xsel) — \
-             use Send instead",
-        )?;
+        clipboard::write(text)
+    }
+}
+
+/// macOS and Linux copy through a clipboard tool.
+#[cfg(not(windows))]
+mod clipboard {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    use anyhow::{Context, Result, bail};
+
+    /// Clipboard tools that read stdin, first one on `PATH` wins.
+    pub(super) const TOOLS: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    /// No clipboard tool on `PATH`, the one copy failure the reviewer can fix.
+    #[derive(Debug)]
+    pub(super) struct NoTool;
+
+    impl std::fmt::Display for NoTool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "no clipboard tool found (wl-clipboard, xclip, or xsel)")
+        }
+    }
+
+    impl std::error::Error for NoTool {}
+
+    pub(super) fn remedy(error: &anyhow::Error) -> Option<&'static str> {
+        error.is::<NoTool>().then_some("install wl-clipboard, xclip, or xsel")
+    }
+
+    /// Pipe `text` into the first tool on `PATH`, succeeding only when it exits clean.
+    pub(super) fn write(text: &str) -> Result<()> {
+        let (cmd, args) = select_tool(TOOLS, crate::proc::on_path).ok_or(NoTool)?;
         let mut child = crate::proc::command(cmd)
             .args(args)
             .stdin(Stdio::piped())
@@ -132,21 +182,36 @@ impl ExportTarget for Clipboard {
         }
         Ok(())
     }
+
+    /// The first clipboard tool the `present` predicate accepts, preserving list order.
+    pub(super) fn select_tool(
+        tools: &'static [(&'static str, &'static [&'static str])],
+        present: impl Fn(&str) -> bool,
+    ) -> Option<(&'static str, &'static [&'static str])> {
+        tools.iter().copied().find(|(cmd, _)| present(cmd))
+    }
 }
 
-/// The first clipboard tool the `present` predicate accepts, preserving list order.
-fn select_tool(
-    tools: &'static [(&'static str, &'static [&'static str])],
-    present: impl Fn(&str) -> bool,
-) -> Option<(&'static str, &'static [&'static str])> {
-    tools.iter().copied().find(|(cmd, _)| present(cmd))
+/// The Win32 clipboard as Unicode text; `clip.exe` would mangle non-ASCII.
+#[cfg(windows)]
+mod clipboard {
+    use anyhow::{Context, Result};
+
+    /// Nothing to install, so no failure here has a remedy to name.
+    pub(super) fn remedy(_error: &anyhow::Error) -> Option<&'static str> {
+        None
+    }
+
+    /// Line breaks as CRLF, the Windows clipboard's own convention.
+    pub(super) fn write(text: &str) -> Result<()> {
+        let text = crate::text::crlf_line_breaks(text);
+        arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text))
+            .context("writing the Windows clipboard")
+    }
 }
 
-/// One chosen agent pane: fill its input via `herdr pane send-text`, then focus it.
-///
-/// The pane is decided before the export runs, by the sole-agent path or by the picker, and
-/// nothing re-resolves it here. A pane that closed in between fails the send and keeps every
-/// comment.
+/// One chosen agent pane: fill its input in one socket request, then focus it.
 #[derive(Clone, Debug)]
 pub struct Agent {
     pub pane: String,
@@ -161,30 +226,31 @@ impl ExportTarget for Agent {
         "agent"
     }
 
-    /// Names the agent it addressed. The send is irreversible and consumes the whole set, so
-    /// this line is the reviewer's only record of where the review went.
+    /// Names the agent: the reviewer's only record of where the review went.
     fn success_message(&self, count: usize) -> String {
-        format!("added {} to {}", counted_comments(count), self.name)
+        format!("sent {} to {}", counted_comments(count), self.name)
     }
 
-    /// The pane was resolved before the send and closed in between, which is the only way this
-    /// happens in practice. herdr's own wording is a JSON envelope around a pane id, so the
-    /// reviewer gets this instead and the payload goes to the log.
-    fn failure_message(&self) -> String {
-        "agent not found".to_string()
+    /// Every send failure is a [`herdr::SendError`]; anything else only says the send failed.
+    fn failure_message(&self, error: &anyhow::Error, copy: &str) -> String {
+        error.downcast_ref().map_or_else(
+            || format!("send failed, press {copy} to copy"),
+            |error| send_failure(error, Some(&self.name), copy),
+        )
     }
 
-    fn format(&self, comments: &[&Comment]) -> String {
-        if self.quote { format_all_quotes(comments) } else { format_all(comments) }
+    fn format(&self, prefix: Option<&str>, comments: &[&Comment]) -> String {
+        if self.quote { format_quotes(prefix, comments) } else { format_review(prefix, comments) }
     }
 
+    /// An agent at a prompt refuses: the picker's rows can be minutes old.
     fn export(&self, text: &str) -> Result<()> {
         if self.quote {
-            return herdr::deliver_quote(&self.pane, text);
+            herdr::deliver_quote(&self.pane, text)?;
+            return Ok(());
         }
         herdr::send_text(&self.pane, text)?;
-        // Focus is a convenience once the text is delivered; a focus failure must NOT fail the
-        // export, or the comments stay unconsumed and the next Send duplicates the whole review.
+        // A focus failure must not fail a delivered export.
         let _ = herdr::focus(&self.pane);
         Ok(())
     }
@@ -193,36 +259,82 @@ impl ExportTarget for Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, CLIPBOARD_TOOLS, Clipboard, ExportTarget, format_all, format_comment, format_quote,
-        select_tool,
+        Agent, Clipboard, ExportTarget, format_comment, format_quote, format_review, send_failure,
     };
     use crate::model::{Comment, Side};
 
+    #[cfg(not(windows))]
     #[test]
     fn clipboard_tool_selection_prefers_list_order_and_can_be_empty() {
+        use super::clipboard::{TOOLS, select_tool};
         // None present -> no tool (the caller surfaces the "install one" error).
-        assert!(select_tool(CLIPBOARD_TOOLS, |_| false).is_none());
+        assert!(select_tool(TOOLS, |_| false).is_none());
         // Only an X11 tool present -> it's chosen, with its selection args.
         assert_eq!(
-            select_tool(CLIPBOARD_TOOLS, |c| c == "xclip"),
+            select_tool(TOOLS, |c| c == "xclip"),
             Some(("xclip", &["-selection", "clipboard"][..]))
         );
         // When several are present, earlier in the list wins (pbcopy over xclip).
         assert_eq!(
-            select_tool(CLIPBOARD_TOOLS, |c| c == "pbcopy" || c == "xclip").map(|(cmd, _)| cmd),
+            select_tool(TOOLS, |c| c == "pbcopy" || c == "xclip").map(|(cmd, _)| cmd),
             Some("pbcopy")
         );
     }
 
     #[test]
     fn export_confirmations_name_the_actual_result_and_pluralize_comments() {
-        // The agent line names the pane it addressed, so a mis-send is visible the moment it
-        // lands.
+        // The agent line names the pane it addressed.
         let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into(), quote: false };
-        assert_eq!(agent.success_message(1), "added 1 comment to release-bot");
-        assert_eq!(agent.success_message(2), "added 2 comments to release-bot");
+        assert_eq!(agent.success_message(1), "sent 1 comment to release-bot");
+        assert_eq!(agent.success_message(2), "sent 2 comments to release-bot");
         assert_eq!(Clipboard.success_message(1), "copied 1 comment");
         assert_eq!(Clipboard.success_message(2), "copied 2 comments");
+    }
+
+    #[test]
+    fn a_failed_send_or_copy_says_what_to_do() {
+        use crate::herdr::{HerdrError as H, SendError as S};
+        let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into(), quote: false };
+        let rows = [
+            (S::Herdr(H::PaneGone), "release-bot closed, press y to copy"),
+            (S::AtPrompt("codex".into()), "answer codex's prompt first"),
+            (S::NoAgent, "no agent in this workspace, press y to copy"),
+            (S::TooLarge, "review too large to send, press y to copy"),
+            (S::Herdr(H::Unanswered), "herdr didn't answer, press y to copy"),
+            // Any other refusal never claims the agent closed.
+            (
+                S::Herdr(H::Refused(Some("internal".into()))),
+                "herdr refused the send, press y to copy",
+            ),
+            (S::Herdr(H::Refused(None)), "herdr refused the send, press y to copy"),
+            (S::Herdr(H::Unreadable), "herdr refused the send, press y to copy"),
+        ];
+        for (error, line) in rows {
+            let error = anyhow::Error::from(error);
+            assert_eq!(agent.failure_message(&error, "y"), line, "{error}");
+        }
+        // Before any agent is chosen, a gone pane names no one.
+        let gone = S::Herdr(H::PaneGone);
+        assert_eq!(send_failure(&gone, None, "y"), "the agent closed, press y to copy");
+        #[cfg(not(windows))]
+        {
+            let missing = anyhow::Error::from(super::clipboard::NoTool);
+            assert_eq!(
+                Clipboard.failure_message(&missing, "y"),
+                "copy failed: install wl-clipboard, xclip, or xsel"
+            );
+            assert_eq!(
+                Clipboard.failure_message(&anyhow::anyhow!("pbcopy exited non-zero"), "y"),
+                "copy failed"
+            );
+        }
+        // Windows has no tool to install, so a failed write never points at one.
+        #[cfg(windows)]
+        {
+            let busy = anyhow::Error::from(arboard::Error::ClipboardOccupied)
+                .context("writing the Windows clipboard");
+            assert_eq!(Clipboard.failure_message(&busy, "y"), "copy failed");
+        }
     }
 
     fn comment(file: &str, side: Side, start: u32, end: u32, lines: &str, text: &str) -> Comment {
@@ -323,7 +435,18 @@ mod tests {
         let b = comment("b.rs", Side::New, 5, 5, "+x", "two");
         let a2 = comment("a.rs", Side::New, 20, 20, "+y", "later");
         let a1 = comment("a.rs", Side::New, 3, 3, "+z", "earlier");
-        let out = format_all(&[&b, &a2, &a1]);
+        let out = format_review(None, &[&b, &a2, &a1]);
         assert_eq!(out, "a.rs:3\n+z\nearlier\n\na.rs:20\n+y\nlater\n\nb.rs:5\n+x\ntwo");
+    }
+
+    #[test]
+    fn the_prefix_heads_the_review_with_its_blank_lines_but_not_its_trailing_space() {
+        let a = comment("a.rs", Side::New, 3, 3, "+z", "rename");
+        assert_eq!(
+            format_review(Some("/fix {all}\r\n\n  then test \n\n"), &[&a]),
+            "/fix {all}\n\n  then test\n\na.rs:3\n+z\nrename"
+        );
+        assert_eq!(format_review(None, &[&a]), "a.rs:3\n+z\nrename");
+        assert_eq!(format_review(Some(" \r\n"), &[&a]), "a.rs:3\n+z\nrename");
     }
 }

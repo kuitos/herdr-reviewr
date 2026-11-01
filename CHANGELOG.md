@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.48.0-kuitos.1] - 2026-11-01
+
+Fork of persiyanov/herdr-reviewr v0.48.0. The fork's own review features are carried onto this
+release.
+
+### Added
+- **reviewr opens in a directory that is not a git repository.** **All files** lists it
+  (honoring `.gitignore`). **Changes** says `not a git repository` and points at **Files**.
+  The scope, its pickers, and the **PR** tab stay inert. The listing stops at 20,000 entries.
+  The open action prefers a git worktree and falls back to any existing directory.
+- **Comment on the exact text you selected.** Drag, double-click, or triple-click, then `c`.
+  The comment quotes the span, underlines it, and the export reads `path:12 · 「quoted text」`.
+  A rendered markdown block still takes a line comment, and that selection is not quoted.
+  Column underlines stay off a split row.
+- **`deliver = "immediate"`** puts each new comment into the agent's input as a quote, between
+  two newlines, without pressing Enter or moving focus. Leftovers sent with `s` use the same
+  shape. `batch` remains the default.
+- **A dialog on the agent's screen refuses the send.** Upstream already refuses a `blocked`
+  agent. The fork also refuses when the visible screen shows a dialog's `Enter` and `Esc`
+  hints together, which is how Codex's model picker reports itself.
+
+### Changed
+- **A drag keeps its selection across a refresh.** Upstream v0.46 dropped the poll and
+  revalidates a settled span against its text when a held reload lands, which is the
+  0.39.0-kuitos.2 fix on the new refresh path.
+
 ## [0.39.0-kuitos.2] - 2026-09-25
 
 ### Fixed
@@ -50,6 +76,125 @@ Fork of persiyanov/herdr-reviewr v0.39.0.
   `blocked` on a confirmation, or its screen shows a dialog's `Enter … Esc` key hints (Codex's
   model picker reports `idle`), reviewr writes nothing and keeps your comments instead of
   typing them into the dialog. ([#86](https://github.com/persiyanov/herdr-reviewr/issues/86))
+## [0.48.0] — 2026-10-19
+
+### Added
+- **Review prefix**: `review_prefix` puts your own text above the comments on every send and copy.
+  Thanks [@macintacos](https://github.com/macintacos) ([#129](https://github.com/persiyanov/herdr-reviewr/issues/129)).
+
+## [0.47.0] — 2026-10-19
+
+### Added
+- **Split view**: `|` shows the diff side by side, and comments, find and copy work on both halves. `diff_view = "split"` starts a fresh pane in split.
+  Thanks [@Tarektouati](https://github.com/Tarektouati) ([#116](https://github.com/persiyanov/herdr-reviewr/issues/116)).
+- **Breaking: `|` is a new default key.** A `[keybindings]` config that already uses `|` now collides and must move it.
+
+## [0.46.2] — 2026-10-18
+
+### Fixed
+- **Toggle from a plugin's pane**: opening from a pane inside another plugin's checkout, like herdr-file-viewer, now reviews the agent's repo, else another pane's, not that checkout.
+  Thanks [@Branpolo](https://github.com/Branpolo) ([#130](https://github.com/persiyanov/herdr-reviewr/issues/130)).
+
+## [0.46.1] — 2026-10-18
+
+### Fixed
+- **Windows install from PowerShell 7**: installing no longer fails at "verifying checksum" when herdr was started from pwsh 7.
+  Thanks [@v-senninha-v](https://github.com/v-senninha-v) ([#127](https://github.com/persiyanov/herdr-reviewr/issues/127)) and [@Yivas](https://github.com/Yivas) ([#142](https://github.com/persiyanov/herdr-reviewr/issues/142)).
+
+## [0.46.0] — 2026-10-06
+
+### Changed
+- **Quiet when nothing changes**: reviewr refreshes when the worktree, git or herdr changes, never on a timer. An idle pane starts no process (v0.45.0 started about 150 to 320 a minute).
+  Thanks [@mikebronner](https://github.com/mikebronner) ([#125](https://github.com/persiyanov/herdr-reviewr/issues/125), [#126](https://github.com/persiyanov/herdr-reviewr/pull/126)) and [@markusthoemmes](https://github.com/markusthoemmes) ([#63](https://github.com/persiyanov/herdr-reviewr/issues/63)).
+- **Hidden panes wait**: a pane on another tab refreshes 30s after a change, and at once when you look at it.
+- **Edits re-read only what changed**: a write refreshes its own paths, so a large repo stays cheap while an agent works.
+- **last turn follows herdr's events**: a turn starts when an agent starts working and counts once a file really changes. A turn whose first write races its snapshot shows empty and says why.
+- **Requires herdr 0.9.3.**
+
+### Fixed
+- **Short turns**: a turn that started and ended between two polls is no longer missed.
+- **A resized window repaints whole**: a monitor that drops and comes back no longer leaves the pane garbled until the next change.
+- **Opening settles at once**: a pane started without herdr's config folder in its environment no longer repaints with your scope and layout a moment after opening.
+
+### Removed
+- **`--poll`**: passing it says it was removed instead of reading its value as the repo path.
+
+## [0.45.0] — 2026-10-05
+
+### Added
+- **Windows**: install, toggle, review, and send on native Windows, with the same plugin and keybindings (thanks @Gerkinfeltser, #94).
+- **Git's editor as a fallback**: with no editor variable set, `e` opens the editor in `core.editor`.
+- **Changed line endings**: a line whose only change is its ending shows a `^M` marker.
+- **Copies**: with git's copy detection on, a copied file is marked `C`, not `R`.
+
+### Changed
+- **Requires herdr 0.9.0.** The plugin actions run in the binary, so bash and jq are no longer needed at runtime.
+- **Send cap**: a send over 256 KiB on the wire refuses with a copy hint, since herdr cannot read more in time.
+- **Send failures say why**: the status names the cause, such as `claude closed` or `herdr didn't answer`, then the copy key.
+- **Index copies under `.git/reviewr/`**: reviewr lists changes and snapshots turns on its own copy of the index, so it needs write access to the git dir.
+- **A file reviewr can't read** shows a notice instead of an empty diff.
+
+### Fixed
+- **No index rewrites**: reading a diff no longer refreshes `.git/index` behind the agent's back.
+- **`last-turn` pairs the right trees**: a diff opened mid-refresh never pairs a new baseline with an old snapshot.
+- **Diffs under `core.autocrlf`**: a file whose only difference is line endings no longer shows every line changed.
+- **Line numbers after a stray CR**: a carriage return inside a line no longer shifts the diff's rows off git's numbering.
+- **Quick double toggle**: two fast presses open reviewr and then close it, and never stack two panes.
+- **PR link**: `o` opens only an http(s) pull request URL.
+- **Submodule bumps**: a moved submodule shows its old and new commit, as `git diff` does, instead of an empty diff.
+
+### Removed
+- **`--resolve-plugin-config`**: the JSON dump lost its last reader with the pane script.
+
+## [0.44.0] — 2026-10-03
+
+### Added
+- **Jump to a line**: `:` and a number land on that line (`:0` first, `:$` last), opening a fold or `<details>` that hides it.
+  Thanks [@black-snow](https://github.com/black-snow) ([#90](https://github.com/persiyanov/herdr-reviewr/issues/90)).
+- **Breaking: `:` is a new default key.** A `[keybindings]` config that already uses `:` now collides and must move it.
+
+## [0.43.0] — 2026-10-03
+
+### Changed
+- **Colors by meaning**: each theme focuses in its own accent, like herdr's frame, and every color reads on what sits behind it.
+  Running checks are yellow, like herdr's working dot.
+- **Rendered markdown takes the theme's heading and code colors**, per level in Catppuccin and Everforest, and inline code sits on a chip.
+
+### Fixed
+- **Line numbers and faint text are readable in every theme**, and tokyo-night-day shows its selection and diff tints.
+
+## [0.42.0] — 2026-10-02
+
+### Changed
+- **Clearer messages**: a refused send says why and how to get the comments out, and errors name what to fix.
+
+### Fixed
+- **`q` asks before dropping unsent comments**: `Q` drops them and quits. A config that binds `Q` must move `quit-discard`.
+  Thanks [@ruinshe](https://github.com/ruinshe) ([#119](https://github.com/persiyanov/herdr-reviewr/issues/119)).
+- **Send refuses an agent at a permission prompt**, which drops a paste, and keeps every comment.
+  Thanks [@stephenchristensen-caredotcom](https://github.com/stephenchristensen-caredotcom) ([#86](https://github.com/persiyanov/herdr-reviewr/issues/86)).
+
+## [0.41.0] — 2026-10-02
+
+### Added
+- **`ayu` theme**, ayu Dark with its own syntax colors.
+  Thanks [@r-darwish](https://github.com/r-darwish) ([#118](https://github.com/persiyanov/herdr-reviewr/pull/118)).
+- **`everforest` theme**, Everforest dark with the hard background.
+  Thanks [@snaggen](https://github.com/snaggen) ([#123](https://github.com/persiyanov/herdr-reviewr/pull/123)).
+
+## [0.40.1] — 2026-10-02
+
+### Fixed
+- **Install works with older curl**, such as on Red Hat 8 and CentOS 7.
+  Thanks [@chengdejerrylin](https://github.com/chengdejerrylin) ([#113](https://github.com/persiyanov/herdr-reviewr/pull/113)).
+- **PR comment ages honor the timestamp's time zone**: a time with an offset like `+02:00` no longer reads as UTC.
+  Thanks [@beefyhalo](https://github.com/beefyhalo) ([#122](https://github.com/persiyanov/herdr-reviewr/pull/122)).
+
+## [0.40.0] — 2026-10-02
+
+### Added
+- **Review markdown rendered**: comments, change marks and find. `m` flips every markdown file in the pane, and `markdown_view` opens it rendered.
+  Thanks [@kamadakohei](https://github.com/kamadakohei) ([#48](https://github.com/persiyanov/herdr-reviewr/issues/48)) and [@zereight](https://github.com/zereight) ([#103](https://github.com/persiyanov/herdr-reviewr/issues/103)) for asking.
 
 ## [0.39.0] — 2026-09-23
 

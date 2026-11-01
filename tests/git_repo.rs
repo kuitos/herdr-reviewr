@@ -7,24 +7,48 @@ use std::path::Path;
 
 use common::Repo;
 use herdr_reviewr::git::{
-    ResolvedBase, abbreviate_oid, all_files, changed_against_tree,
-    changed_files as changed_files_oid, checked_out_branch, default_branch_name, delete_base_pick,
-    file_content, list_branches, merge_base as merge_base_oid, read_base_pick, read_baseline_ref,
-    resolve_base, resolve_commit, snapshot_worktree, write_base_pick, write_baseline_ref,
+    DiffSides, ResolvedBase, abbreviate_oid, all_files, changed_between, changed_from,
+    checked_out_branch, default_branch_name, delete_base_pick, diff_sides, list_branches,
+    merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base, resolve_commit,
+    snapshot_worktree, write_base_pick, write_baseline_ref,
 };
 use herdr_reviewr::model::{ChangeKind, ChangedFile, Scope};
+use herdr_reviewr::world::{WorldInput, build_changed};
 
 fn by_path(files: &[ChangedFile]) -> HashMap<&str, &ChangedFile> {
     files.iter().map(|f| (f.path.as_str(), f)).collect()
 }
 
+/// `scope`'s changeset as the world worker builds it, the `--base` flag `base`.
 fn changed_files(
     repo: &Path,
     scope: Scope,
     base: Option<&str>,
 ) -> anyhow::Result<Vec<ChangedFile>> {
-    let winner = resolve_base(repo, base).map_err(|e| anyhow::anyhow!("{}", e.0))?.status.winner;
-    changed_files_oid(repo, scope, winner.as_ref().map(herdr_reviewr::git::ResolvedBase::oid))
+    Ok(build_changed(&world_input(repo, scope, base, None))?
+        .changeset
+        .files
+        .into_values()
+        .collect())
+}
+
+/// `last-turn`'s changeset against the baseline `tree`, as the world worker builds it.
+fn changed_against_tree(repo: &Path, tree: &str) -> anyhow::Result<Vec<ChangedFile>> {
+    let build = build_changed(&world_input(repo, Scope::LastTurn, None, Some(tree)))?;
+    Ok(build.changeset.files.into_values().collect())
+}
+
+fn world_input(repo: &Path, scope: Scope, base: Option<&str>, turn: Option<&str>) -> WorldInput {
+    WorldInput {
+        repo: repo.to_path_buf(),
+        tab: herdr_reviewr::app::Tab::Changes,
+        scope,
+        base: base.map(str::to_string),
+        base_epoch: 0,
+        turn_baseline: turn.map(str::to_string),
+        commit_pick: None,
+        toggled_dirs: std::collections::HashSet::default(),
+    }
 }
 
 fn merge_base(repo: &Path, base: Option<&str>) -> Option<String> {
@@ -33,10 +57,177 @@ fn merge_base(repo: &Path, base: Option<&str>) -> Option<String> {
 }
 
 #[test]
+fn a_diffs_sides_are_the_committed_blob_and_the_text_git_would_store() {
+    // git is the oracle: the committed blob against what `git add` would store.
+    let contents =
+        ["a\r\nb\r\n", "a\nb\n", "a\r\nb\nc\r\n", "a\r\nb\rc\r\n", "a\r\nb", "$Id: x $\r\nb\r\n"];
+    // core.autocrlf, .gitattributes, and the content each file was committed with.
+    let lf = "x\ny\n";
+    let regimes = [
+        ("true", "", lf),
+        ("input", "", lf),
+        ("false", "", lf),
+        ("false", "* text\n", lf),
+        ("false", "* text=auto\n", lf),
+        ("false", "* eol=lf\n", lf),
+        ("true", "* -text\n", lf),
+        ("true", "* text eol=crlf\n", lf),
+        ("true", "* ident\n", lf),
+        ("true", "* filter=upper\n", lf),
+        // `auto` keeps the CRLF of a file whose index blob already holds it.
+        ("true", "", "x\r\ny\r\n"),
+        ("false", "* text=auto\n", "x\r\ny\r\n"),
+        // An index blob with a lone CR under `-text`, then read under autocrlf.
+        ("true", "", "x\ry\n"),
+    ];
+    for (autocrlf, attributes, committed) in regimes {
+        let r = Repo::init();
+        r.git(&["config", "core.autocrlf", "false"]);
+        r.git(&["config", "filter.upper.clean", "tr a-z A-Z"]);
+        r.write(".gitattributes", "* -text\n");
+        for i in 0..contents.len() {
+            r.write(&format!("f{i}.txt"), committed);
+        }
+        r.commit_all("base");
+        r.git(&["config", "core.autocrlf", autocrlf]);
+        r.write(".gitattributes", attributes);
+        for (i, content) in contents.iter().enumerate() {
+            let path = format!("f{i}.txt");
+            let case = format!("{content:?}, autocrlf={autocrlf}, {attributes:?}, {committed:?}");
+            r.write(&path, content);
+            let sides = diff_sides(r.path(), "HEAD", None, &path, None).expect(&case);
+            r.git(&["add", &path]);
+            let old = r.git(&["cat-file", "blob", &format!("HEAD:{path}")]);
+            let new = r.git(&["cat-file", "blob", &format!(":{path}")]);
+            assert_eq!(sides, DiffSides::Text { old, new }, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_submodule_bump_reads_as_git_prints_it_and_an_empty_file_as_empty() {
+    let r = Repo::init();
+    r.write("seed.txt", "x\n");
+    r.commit_all("init");
+    let (a, b) = ("1".repeat(40), "2".repeat(40));
+    r.git(&["update-index", "--add", "--cacheinfo", &format!("160000,{a},sub")]);
+    r.git(&["commit", "-q", "-m", "sub at a"]);
+    let at_a = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["update-index", "--cacheinfo", &format!("160000,{b},sub")]);
+    r.git(&["commit", "-q", "-m", "sub at b"]);
+    // A user's log format would print the bump with no hunk.
+    r.git(&["config", "diff.submodule", "log"]);
+    let text = |old: &str, new: &str| DiffSides::Text { old: old.into(), new: new.into() };
+
+    let bump = diff_sides(r.path(), &at_a, Some("HEAD"), "sub", None).unwrap();
+    assert_eq!(
+        bump,
+        text(&format!("Subproject commit {a}\n"), &format!("Subproject commit {b}\n"))
+    );
+    r.write("empty.txt", "");
+    r.git(&["add", "empty.txt"]);
+    assert_eq!(diff_sides(r.path(), "HEAD", None, "empty.txt", None).unwrap(), text("", ""));
+    // A staged file unstaged since the listing: git sees it at neither end, so a stale row is empty.
+    r.write("gone.txt", "x\n");
+    assert_eq!(diff_sides(r.path(), "HEAD", None, "gone.txt", None).unwrap(), text("", ""));
+}
+
+#[test]
+fn a_renamed_files_sides_read_the_old_path_and_an_unchanged_one_reads_its_blob() {
+    let r = Repo::init();
+    r.write("a.txt", "one\ntwo\nthree\nfour\n");
+    r.write("same.txt", "same\n");
+    r.write("[x].txt", "glob\n");
+    r.write("x.txt", "not me\n");
+    r.commit_all("init");
+    r.git(&["mv", "a.txt", "b.txt"]);
+    r.write("b.txt", "one\ntwo\nthree\nFOUR\n");
+    r.git(&["mv", "same.txt", "moved.txt"]);
+    r.write("x.txt", "edited\n");
+    let text = |old: &str, new: &str| DiffSides::Text { old: old.into(), new: new.into() };
+
+    let renamed = diff_sides(r.path(), "HEAD", None, "b.txt", Some("a.txt")).unwrap();
+    assert_eq!(renamed, text("one\ntwo\nthree\nfour\n", "one\ntwo\nthree\nFOUR\n"));
+    let moved = diff_sides(r.path(), "HEAD", None, "moved.txt", Some("same.txt")).unwrap();
+    assert_eq!(moved, text("same\n", "same\n"), "a pure rename: both sides are the blob");
+    // A re-created, staged source never joins the rename's sides.
+    r.write("a.txt", "fresh\n");
+    r.git(&["add", "a.txt"]);
+    let renamed = diff_sides(r.path(), "HEAD", None, "b.txt", Some("a.txt")).unwrap();
+    assert_eq!(renamed, text("one\ntwo\nthree\nfour\n", "one\ntwo\nthree\nFOUR\n"));
+    r.git(&["rm", "-q", "--cached", "a.txt"]);
+    std::fs::remove_file(r.path().join("a.txt")).unwrap();
+    // A copy's source is unchanged, so the old side is its committed content.
+    r.write("copy.txt", "one\ntwo\nTHREE\nfour\n");
+    r.git(&["add", "copy.txt"]);
+    let copy = diff_sides(r.path(), "HEAD", None, "copy.txt", Some("x.txt")).unwrap();
+    assert_eq!(copy, text("not me\n", "one\ntwo\nTHREE\nfour\n"));
+    // A path is literal: `[x].txt` is not a glob that reaches the edited `x.txt`.
+    let literal = diff_sides(r.path(), "HEAD", None, "[x].txt", None).unwrap();
+    assert_eq!(literal, text("glob\n", "glob\n"));
+    // Tree to tree, the way `commits` and `last-turn` read.
+    r.commit_all("second");
+    let between = diff_sides(r.path(), "HEAD~1", Some("HEAD"), "x.txt", None).unwrap();
+    assert_eq!(between, text("not me\n", "edited\n"));
+}
+
+#[test]
+fn a_file_that_replaced_a_directory_reads_only_its_own_sides() {
+    let r = Repo::init();
+    r.write("foo/a", "inner1\ninner2\n");
+    r.write("bar", "plain\n");
+    r.commit_all("init");
+    r.remove("foo/a");
+    std::fs::remove_dir(r.path().join("foo")).unwrap();
+    r.write("foo", "file1\n");
+    r.remove("bar");
+    r.write("bar/b", "nested\n");
+    r.commit_all("swap");
+    let text = |old: &str, new: &str| DiffSides::Text { old: old.into(), new: new.into() };
+    // `-- foo` also matches `foo/a`, which must never join `foo`'s sides.
+    assert_eq!(
+        diff_sides(r.path(), "HEAD~1", Some("HEAD"), "foo", None).unwrap(),
+        text("", "file1\n")
+    );
+    assert_eq!(
+        diff_sides(r.path(), "HEAD~1", Some("HEAD"), "bar", None).unwrap(),
+        text("plain\n", "")
+    );
+    // A body line spelled like a header is still body.
+    r.write("q.sql", "-- /dev/null\nkeep\n");
+    r.commit_all("q");
+    r.write("q.sql", "keep\n++ /dev/null\n");
+    let sides = diff_sides(r.path(), "HEAD", None, "q.sql", None).unwrap();
+    assert_eq!(sides, text("-- /dev/null\nkeep\n", "keep\n++ /dev/null\n"));
+    // Names git quotes or ends with a tab still find their own section; Windows forbids `"`.
+    let names: &[&str] = if cfg!(unix) {
+        &["say \"hi\".txt", "back\\slash.txt", "two words.txt"]
+    } else {
+        &["two words.txt"]
+    };
+    for &name in names {
+        r.write(name, "one\n");
+        r.commit_all("add");
+        r.write(name, "two\n");
+        assert_eq!(diff_sides(r.path(), "HEAD", None, name, None).unwrap(), text("one\n", "two\n"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_became_a_symlink_reads_both_its_sections() {
+    let r = Repo::init();
+    r.write("t", "body\n");
+    r.commit_all("init");
+    r.remove("t");
+    std::os::unix::fs::symlink("elsewhere", r.path().join("t")).unwrap();
+    let sides = diff_sides(r.path(), "HEAD", None, "t", None).unwrap();
+    assert_eq!(sides, DiffSides::Text { old: "body\n".into(), new: "elsewhere".into() });
+}
+
+#[test]
 fn a_path_the_diff_attribute_unsets_carries_gits_no_text_diff_verdict() {
-    // `.gitattributes` `-diff` makes git refuse to text-diff a path even though its bytes
-    // are text. The changeset must carry that verdict, not re-decide from content
-    //.
+    // `-diff` text is binary to git, and the changeset carries that verdict.
     let r = Repo::init();
     r.write(".gitattributes", "lock.txt -diff\n");
     r.write("lock.txt", "one\ntwo\n");
@@ -78,9 +269,7 @@ fn the_binary_macro_and_real_binary_content_both_carry_the_verdict() {
 
 #[test]
 fn an_untracked_file_the_diff_attribute_unsets_carries_the_verdict_too() {
-    // The common shape right after an agent scaffolds a project: the lockfile is written and
-    // marked `-diff`, but nothing is committed yet. Identical bytes must not be treated
-    // differently for being untracked.
+    // A fresh `-diff` lockfile, untracked: the verdict must not depend on being tracked.
     let r = Repo::init();
     r.write("keep.rs", "fn a() {}\n");
     r.commit_all("init");
@@ -100,8 +289,7 @@ fn an_untracked_file_the_diff_attribute_unsets_carries_the_verdict_too() {
 
 #[test]
 fn an_untracked_binary_file_carries_the_verdict_from_its_content() {
-    // No numstat speaks for an untracked path, so content answers the half `.gitattributes`
-    // does not.
+    // An untracked path has no numstat, so its content decides.
     let r = Repo::init();
     r.write("keep.rs", "fn a() {}\n");
     r.commit_all("init");
@@ -143,25 +331,11 @@ fn lists_every_change_kind_with_stats() {
 }
 
 #[test]
-fn file_content_reads_the_committed_version_not_the_worktree() {
-    let r = Repo::init();
-    r.write("a.rs", "alpha\nbeta\ngamma\n");
-    r.commit_all("init");
-    r.write("a.rs", "alpha\nBETA\ngamma\n"); // the worktree moves on
-
-    // The old side of a diff: HEAD's content, not the working tree.
-    assert_eq!(file_content(r.path(), "HEAD", "a.rs"), "alpha\nbeta\ngamma\n");
-}
-
-#[test]
-fn file_content_is_empty_for_a_path_absent_at_that_rev() {
+fn an_untracked_file_counts_its_lines_as_additions() {
     let r = Repo::init();
     r.write("seed.rs", "x\n");
     r.commit_all("init");
-    r.write("fresh.rs", "line one\nline two\n"); // untracked — not in HEAD
-
-    // An added/untracked file has no old side, so its HEAD content is empty.
-    assert_eq!(file_content(r.path(), "HEAD", "fresh.rs"), "");
+    r.write("fresh.rs", "line one\nline two\n");
     let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
     assert_eq!(by_path(&files)["fresh.rs"].additions, 2);
 }
@@ -247,8 +421,7 @@ fn picking_the_default_name_deletes_the_pick_so_a_re_default_is_followed() {
     assert_eq!(status.winner.unwrap().name(), "trunk");
     assert_eq!(status.skipped, None);
 
-    // A ref an earlier release wrote with the default's name changes nothing: the default
-    // step yields the same base, nothing is skipped, and a pick replaces it as ever.
+    // An old pick naming the default changes nothing.
     r.write_raw_base_pick("trunk");
     let status = resolve_base(r.path(), None).unwrap().status;
     assert_eq!(status.winner.unwrap().name(), "trunk");
@@ -298,8 +471,7 @@ fn a_nonexistent_flag_falls_through_and_reads_as_skipped() {
     r.git(&["branch", "picked", "main"]);
     write_base_pick(r.path(), "picked").unwrap();
 
-    // A `--base` naming no existing ref is skipped, not an error; the pick resolves, and
-    // the header can name the dead flag.
+    // A dead `--base` is skipped, not an error, and the header can name it.
     assert_eq!(merge_base(r.path(), Some("no-such-ref")), Some(branch_point));
     let status = resolve_base(r.path(), Some("no-such-ref")).unwrap().status;
     assert_eq!(status.skipped.as_deref(), Some("no-such-ref"));
@@ -315,21 +487,18 @@ fn a_prefixed_flag_spelling_resolves_to_the_bare_name() {
     r.write("base.rs", "2\n");
     r.commit_all("diverge");
 
-    // `--base origin/main` resolves as a verbatim rev, but the header and the PR name
-    // shield carry the bare spelling.
+    // `--base origin/main` resolves verbatim but carries the bare name.
     let winner = resolve_base(r.path(), Some("origin/main")).unwrap().status.winner.unwrap();
     assert_eq!(winner.name(), "main");
 
-    // A prefixed rev that is not a branch keeps the flag spelling, so `origin/HEAD` does
-    // not paint as live `HEAD`.
+    // A prefixed non-branch keeps its spelling, so `origin/HEAD` never reads as `HEAD`.
     let winner = resolve_base(r.path(), Some("origin/HEAD")).unwrap().status.winner.unwrap();
     assert_eq!(winner.name(), "origin/HEAD");
 
     let status = resolve_base(r.path(), Some("origin/HEAD~99")).unwrap().status;
     assert_eq!(status.skipped.as_deref(), Some("origin/HEAD~99"));
 
-    // A prefixed spelling that resolves to nothing is skipped under the same bare name,
-    // so the header reads `· gone missing`, never `· origin/gone missing`.
+    // A dead prefixed spelling is skipped under its bare name.
     let status = resolve_base(r.path(), Some("origin/gone")).unwrap().status;
     assert_eq!(status.skipped.as_deref(), Some("gone"));
 }
@@ -344,14 +513,11 @@ fn a_pick_git_could_never_have_written_is_no_pick() {
     r.write("base.rs", "2\n");
     r.commit_all("diverge");
 
-    // The pick ref is shared repository state any tool can write, and a skipped pick paints
-    // its name in the header: a blob carrying control bytes is no pick at all, so nothing
-    // can smuggle an escape sequence into the frame.
+    // A pick blob with control bytes is no pick, so it can't smuggle escapes into the header.
     r.write_raw_base_pick("dev\u{1b}]0;pwned\u{7}");
     assert_eq!(read_base_pick(r.path()).unwrap(), None);
 
-    // A leftover expression in the blob is a spelling. Too
-    // deep to resolve, it is skipped, not discarded.
+    // An expression is a spelling: skipped when it does not resolve, never discarded.
     r.write_raw_base_pick("main~5");
     assert_eq!(read_base_pick(r.path()).unwrap().as_deref(), Some("main~5"));
 
@@ -376,8 +542,7 @@ fn a_dormant_pick_is_skipped_and_reactivates() {
     let winner = resolve_base(r.path(), None).unwrap().status.winner.unwrap();
     assert_eq!(winner.name(), "dev");
 
-    // The branch disappears: the pick is kept and skipped, the default wins, and the
-    // header can say so.
+    // A deleted pick is kept and skipped, and the default wins.
     r.git(&["branch", "-D", "dev"]);
     let status = resolve_base(r.path(), None).unwrap().status;
     let winner = status.winner.unwrap();
@@ -399,8 +564,7 @@ fn a_dormant_pick_survives_even_when_nothing_resolves() {
     r.git(&["branch", "-m", "main", "trunk"]); // no `main`/`master`: no default to fall back on
     write_base_pick(r.path(), "gone").unwrap();
 
-    // No flag, no default, and the picked branch is missing: the skip still reports, so
-    // the header reads `no base · gone missing`, never a bare `no base`.
+    // With nothing resolving, the skip still reports.
     let status = resolve_base(r.path(), None).unwrap().status;
     assert_eq!(status.winner, None);
     assert_eq!(status.skipped.as_deref(), Some("gone"));
@@ -620,9 +784,7 @@ fn without_origin_head_the_default_falls_back_to_the_configured_then_conventiona
     r.git(&["branch", "-m", "master", "other"]);
     assert_eq!(default_branch_name(r.path()).unwrap(), None);
 
-    // The name must spell a ref exactly: on a case-insensitive filesystem `rev-parse`
-    // would resolve `refs/heads/main` to a branch named `Main`, and that name would
-    // then paint the header and match no picker row.
+    // The name must spell a ref exactly, case included.
     r.git(&["branch", "-m", "other", "Main"]);
     assert_eq!(default_branch_name(r.path()).unwrap(), None);
     r.git(&["branch", "-m", "Main", "other"]);
@@ -630,10 +792,7 @@ fn without_origin_head_the_default_falls_back_to_the_configured_then_conventiona
     assert_eq!(default_branch_name(r.path()).unwrap(), None, "a pattern prefix is no match");
     r.git(&["branch", "-m", "main/foo", "other"]);
 
-    // A fallback name qualifies through the same origin-then-local lookup the chain
-    // resolves it with: `origin/main` with no `origin/HEAD` (a remote never `set-head`)
-    // and no local `main` is still the default, and a dangling `origin/HEAD` falls
-    // through to it.
+    // A fallback name qualifies through the origin-then-local lookup.
     let oid = r.git(&["rev-parse", "HEAD"]).trim().to_string();
     r.git(&["update-ref", "refs/remotes/origin/main", &oid]);
     assert_eq!(default_branch_name(r.path()).unwrap().as_deref(), Some("main"));
@@ -651,8 +810,7 @@ fn a_dangling_origin_head_symref_names_no_default() {
     r.git(&["branch", "-m", "main", "trunk"]); // no `main`/`master`: no default to fall back on
     r.set_origin_default("master", "HEAD");
 
-    // `fetch --prune` after a server-side rename deletes the target but leaves the
-    // symref: a name resolving to nothing is no default.
+    // A dangling `origin/HEAD` names no default.
     r.git(&["update-ref", "-d", "refs/remotes/origin/master"]);
     assert_eq!(default_branch_name(r.path()).unwrap(), None);
 }
@@ -665,8 +823,7 @@ fn a_plain_ref_origin_head_names_the_matching_tip() {
     let oid = r.git(&["rev-parse", "HEAD"]).trim().to_string();
     r.git(&["update-ref", "refs/remotes/origin/trunk", &oid]);
 
-    // Some clones carry `origin/HEAD` as a plain ref, not a symref: the default is the
-    // origin tip at the same commit.
+    // A plain-ref `origin/HEAD` names the origin tip at its commit.
     r.git(&["update-ref", "refs/remotes/origin/HEAD", &oid]);
     assert_eq!(default_branch_name(r.path()).unwrap().as_deref(), Some("trunk"));
 }
@@ -682,8 +839,7 @@ fn list_branches_merges_names_newest_first_and_lists_the_checked_out() {
     r.git(&["add", "-A"]);
     r.git_env(&["commit", "-q", "-m", "one"], &[("GIT_COMMITTER_DATE", "2026-01-01T00:00:00")]);
     r.git(&["branch", "older"]);
-    // Every branch gets its own commit date, so the asserted order follows the contract
-    // rather than git's tie-break between two branches sharing a timestamp.
+    // Distinct commit dates, so the order never rests on git's tie-break.
     r.write("a.rs", "1b\n");
     r.git(&["add", "-A"]);
     r.git_env(&["commit", "-q", "-m", "middle"], &[("GIT_COMMITTER_DATE", "2026-02-01T00:00:00")]);
@@ -693,8 +849,7 @@ fn list_branches_merges_names_newest_first_and_lists_the_checked_out() {
     r.commit_all("two");
     r.git(&["branch", "newer"]);
 
-    // Local and origin names merge (main is local and origin/main, at the same commit), the
-    // newest tip sorts first, and the checked-out branch is listed: a base like any other.
+    // Local and origin names merge, newest first, the checked-out branch included.
     let rows = list_branches(r.path()).unwrap();
     assert_eq!(names(&rows), ["feature", "newer", "main", "older"]);
     let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap().tip_secs;
@@ -752,8 +907,7 @@ fn branch_scope_is_a_superset_of_uncommitted() {
 
 #[test]
 fn branch_scope_equals_uncommitted_when_head_is_the_base() {
-    // HEAD sits exactly on the base, so the merge-base is HEAD: branch shows the
-    // working-tree changes rather than going empty.
+    // HEAD on the base: `branch` shows the worktree's changes.
     let r = Repo::init();
     r.write("base.rs", "1\n");
     r.commit_all("base");
@@ -771,8 +925,7 @@ fn ignored_paths_never_enter_changes() {
     r.write("ignored/note.md", "scratch\n");
     r.write("build/out.o", "junk\n");
 
-    // Every scope respects .gitignore, without exception: a path git ignores is not a
-    // change. To review a file, track it.
+    // An ignored path is no change in any scope.
     let has_ignored = |files: &[ChangedFile]| {
         files.iter().any(|f| f.path.starts_with("ignored/") || f.path.starts_with("build/"))
     };
@@ -782,8 +935,7 @@ fn ignored_paths_never_enter_changes() {
     );
     assert!(!has_ignored(&changed_files(r.path(), Scope::Branch, Some("main")).unwrap()), "branch");
 
-    // last-turn: even an ignored file that changes within the turn stays out, because the
-    // baseline snapshot and the live snapshot both honor .gitignore.
+    // In `last-turn` too: both snapshots honor .gitignore.
     let base = snapshot_worktree(r.path()).unwrap();
     r.write("ignored/note.md", "scratch v2\n");
     assert!(!has_ignored(&changed_against_tree(r.path(), &base).unwrap()), "last-turn");
@@ -799,8 +951,7 @@ fn branch_scope_is_empty_without_a_recorded_base() {
     r.write("feature.rs", "x\n");
     r.commit_all("feature work");
 
-    // base = None and nothing recorded → no base, and the scope lists nothing rather than
-    // guessing.
+    // No base: the scope lists nothing rather than guessing.
     let files = changed_files(r.path(), Scope::Branch, None).unwrap();
     assert!(files.is_empty(), "no source resolves, so the scope shows nothing");
 
@@ -824,10 +975,253 @@ fn rename_is_reported_at_the_new_path() {
     assert_eq!(renamed.previous_path.as_deref(), Some("old_name.rs"));
 }
 
+/// An untracked link to a device has no lines: counting would read it without end.
+#[cfg(unix)]
+#[test]
+fn an_untracked_link_to_a_device_lists_without_reading_it() {
+    let r = Repo::init();
+    r.write("a.txt", "a\n");
+    r.commit_all("init");
+    std::os::unix::fs::symlink("/dev/zero", r.path().join("zero")).unwrap();
+    let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let zero = files.iter().find(|f| f.path == "zero").expect("the link lists");
+    assert_eq!((zero.kind, zero.additions), (ChangeKind::Untracked, 0));
+    // A link to a FIFO would block the open itself. git lists the link, never a bare FIFO.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let fifo = elsewhere.path().join("pipe");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    std::os::unix::fs::symlink(&fifo, r.path().join("pipe")).unwrap();
+    let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    assert!(files.iter().any(|f| f.path == "pipe" && f.additions == 0), "{files:?}");
+}
+
+/// Past git's default threshold an untracked file is binary, unread; sparse files.
+#[cfg(unix)]
+#[test]
+fn an_untracked_file_past_the_big_file_threshold_is_binary() {
+    let r = Repo::init();
+    r.write("a.txt", "a\n");
+    r.commit_all("init");
+    for (name, len) in [("at.txt", 512 << 20), ("past.txt", (512 << 20) + 1)] {
+        let file = std::fs::File::create(r.path().join(name)).unwrap();
+        std::io::Write::write_all(&mut &file, &b"a\n".repeat(4096)).unwrap();
+        file.set_len(len).unwrap();
+    }
+    let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let verdict = |path: &str| {
+        let f = files.iter().find(|f| f.path == path).unwrap();
+        (f.binary, f.additions)
+    };
+    assert_eq!(verdict("at.txt"), (false, 4097));
+    assert_eq!(verdict("past.txt"), (true, 0));
+}
+
+/// A copy a killed process left behind holds no lock, and the sweep removes it; a live one stays.
+#[test]
+fn a_dead_processs_index_copy_is_swept() {
+    let r = Repo::init();
+    let home = r.path().join(".git/reviewr");
+    std::fs::create_dir_all(&home).unwrap();
+    let copy = || tempfile::Builder::new().prefix("index-").tempdir_in(&home).unwrap();
+    let dead = copy().keep();
+    std::fs::write(dead.join("lock"), "").unwrap();
+    std::fs::write(dead.join("index"), "stale").unwrap();
+    let live = copy();
+    let held = std::fs::File::create(live.path().join("lock")).unwrap();
+    held.lock().unwrap();
+    // A copy still being made has no lock yet, and is young.
+    let making = copy();
+    std::fs::write(making.path().join("index"), "seeding").unwrap();
+    herdr_reviewr::git::sweep_dead_copies(r.path());
+    assert!(!dead.exists(), "{} survived", dead.display());
+    assert!(live.path().exists(), "a live copy was swept");
+    assert!(making.path().exists(), "a copy being made was swept");
+}
+
+#[test]
+fn index_copies_live_in_the_git_dir_and_a_seeded_snapshot_is_the_worktree() {
+    let r = Repo::init();
+    r.write("a.txt", "one\n");
+    r.write("b.txt", "same\n");
+    r.commit_all("init");
+    changed_from(r.path(), "HEAD").unwrap();
+    // Touched without a change, then one file edited and one added.
+    std::fs::File::options()
+        .write(true)
+        .open(r.path().join("b.txt"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    r.write("a.txt", "two\n");
+    r.write("c.txt", "new\n");
+    let snapshot = herdr_reviewr::git::snapshot_worktree(r.path()).unwrap();
+
+    let home = r.path().join(".git/reviewr");
+    let copies = std::fs::read_dir(&home).unwrap().flatten();
+    assert!(copies.into_iter().any(|e| e.file_name().to_string_lossy().starts_with("index-")));
+    // git's own tree of the same worktree, from a throwaway index.
+    let scratch = tempfile::tempdir().unwrap();
+    let own = scratch.path().join("index");
+    let env = [("GIT_INDEX_FILE", own.to_str().unwrap())];
+    r.git_env(&["add", "-A"], &env);
+    assert_eq!(snapshot, r.git_env(&["write-tree"], &env).trim());
+    // Quitting takes the session copies with it.
+    herdr_reviewr::git::end_sessions();
+    let left = std::fs::read_dir(&home).unwrap().flatten();
+    let left: Vec<_> = left.map(|e| e.file_name()).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_worktree_re_added_at_its_path_lists_against_its_own_index() {
+    let r = Repo::init();
+    r.write("a.txt", "one\n");
+    r.commit_all("init");
+    let out = tempfile::tempdir().unwrap();
+    let (first, other) = (out.path().join("a/wt"), out.path().join("b/wt"));
+    let add = |branch: &str, at: &Path| {
+        r.git(&["worktree", "add", "-q", "-b", branch, at.to_str().unwrap()]);
+    };
+    add("one", &first);
+    assert!(changed_from(&first, "HEAD").unwrap().is_empty());
+    r.git(&["worktree", "remove", "--force", first.to_str().unwrap()]);
+    // The other worktree takes the freed admin dir and stages a change there.
+    add("two", &other);
+    git_in(&other, &["rm", "-q", "--cached", "a.txt"]);
+    add("three", &first);
+    let listed = changed_from(&first, "HEAD").unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
+    // Re-added under the same admin name, its copy went with the old admin dir.
+    r.git(&["worktree", "remove", "--force", first.to_str().unwrap()]);
+    add("four", &first);
+    assert!(changed_from(&first, "HEAD").unwrap().is_empty());
+    // A pruned admin dir stays gone: reviewr never builds one back to hold its copy.
+    let out = std::process::Command::new("git")
+        .current_dir(&first)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .unwrap();
+    let admin = std::path::PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+    std::fs::remove_dir_all(&admin).unwrap();
+    let _ = changed_from(&first, "HEAD");
+    assert!(!admin.exists(), "reviewr re-created {}", admin.display());
+}
+
+/// Run git in `dir`, asserting success.
+fn git_in(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git").current_dir(dir).args(args).status().unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+#[test]
+fn a_split_index_gets_no_new_shared_index_from_reviewr() {
+    let r = Repo::init();
+    r.git(&["config", "core.splitIndex", "true"]);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        r.write(name, "one\n");
+    }
+    r.commit_all("init");
+    let shared = || -> Vec<String> {
+        let names = std::fs::read_dir(r.path().join(".git")).unwrap().flatten();
+        let mut names: Vec<String> = names
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("sharedindex."))
+            .collect();
+        names.sort();
+        names
+    };
+    let before = shared();
+    // Touched and edited, so every refresh has stat info to write.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    r.write("a.txt", "one\n");
+    r.write("b.txt", "two\n");
+    changed_from(r.path(), "HEAD").unwrap();
+    herdr_reviewr::git::snapshot_worktree(r.path()).unwrap();
+    changed_from(r.path(), "HEAD").unwrap();
+    assert_eq!(shared(), before, "reviewr wrote a shared index into .git");
+}
+
+#[test]
+fn a_turn_snapshot_holds_through_a_merge_conflict() {
+    // With the session copy already made by a listing, and with the snapshot making it.
+    for listed_first in [true, false] {
+        let r = Repo::init();
+        r.write("f.txt", "base\n");
+        r.commit_all("init");
+        r.git(&["checkout", "-q", "-b", "side"]);
+        r.write("f.txt", "side\n");
+        r.commit_all("side");
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", "main\n");
+        r.commit_all("main");
+        // The merge stops on the conflict, leaving `f.txt` unmerged in the index.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(r.path())
+            .args(["merge", "-q", "side"])
+            .output();
+        if listed_first {
+            changed_from(r.path(), "HEAD").unwrap();
+        }
+        let snapshot = herdr_reviewr::git::snapshot_worktree(r.path());
+        let snapshot = snapshot.expect("an agent mid-merge stops turn tracking");
+        // The tree holds the worktree's conflict-marked file, as git's own `add -A` records it.
+        let scratch = tempfile::tempdir().unwrap();
+        let own = scratch.path().join("index");
+        let env = [("GIT_INDEX_FILE", own.to_str().unwrap())];
+        r.git_env(&["add", "-A"], &env);
+        assert_eq!(snapshot, r.git_env(&["write-tree"], &env).trim(), "{listed_first}");
+    }
+}
+
+#[test]
+fn every_changed_file_carries_the_size_of_each_side_git_stores() {
+    let r = Repo::init();
+    // Windows forbids a newline, and a colon, in a file name.
+    let odd = if cfg!(unix) { "line\nbreak: odd.txt" } else { "odd name.txt" };
+    r.write("a.txt", "four\n");
+    r.write(odd, "seven\n");
+    r.commit_all("init");
+    r.write("a.txt", "twelve bytes\n");
+    r.write(odd, "ten bytes\n");
+    r.commit_all("edit");
+
+    // Tree to tree, sized by id, so a newline in a path sizes like any other.
+    let between = changed_between(r.path(), "HEAD~1", "HEAD").unwrap();
+    let sizes: Vec<_> = between.iter().map(|f| (f.path.as_str(), f.old_size, f.new_size)).collect();
+    assert_eq!(sizes, [("a.txt", 5, Some(13)), (odd, 6, Some(10))]);
+    // Against the worktree, the new side is the file itself, sized when it is read.
+    r.write("a.txt", "x\n");
+    let from = changed_from(r.path(), "HEAD").unwrap();
+    let sizes: Vec<_> = from.iter().map(|f| (f.path.as_str(), f.old_size, f.new_size)).collect();
+    assert_eq!(sizes, [("a.txt", 13, None)]);
+}
+
+#[test]
+fn a_copy_is_reported_as_a_copy_and_reads_its_source() {
+    let r = Repo::init();
+    r.git(&["config", "diff.renames", "copies"]);
+    r.write("orig.rs", "one\ntwo\nthree\nfour\nfive\n");
+    r.commit_all("init");
+    r.write("orig.rs", "one\ntwo\nthree\nfour\nfive\nsix\n");
+    r.write("copy.rs", "one\ntwo\nTHREE\nfour\nfive\n");
+    r.git(&["add", "-A"]);
+
+    let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let copy = files.iter().find(|f| f.path == "copy.rs").expect("the copy");
+    assert_eq!((copy.kind, copy.previous_path.as_deref()), (ChangeKind::Copied, Some("orig.rs")));
+    // The source edited in its own right stays out of the copy's sides.
+    let sides = diff_sides(r.path(), "HEAD", None, "copy.rs", Some("orig.rs")).unwrap();
+    let want = DiffSides::Text {
+        old: "one\ntwo\nthree\nfour\nfive\n".into(),
+        new: "one\ntwo\nTHREE\nfour\nfive\n".into(),
+    };
+    assert_eq!(sides, want);
+}
+
 #[test]
 fn a_directory_removing_rename_keeps_its_stats() {
-    // Regression for the `-z` migration: `a/b/f.rs -> a/f.rs` once produced a `a//f.rs`
-    // numstat key that never matched, so the renamed+edited file showed +0 -0.
+    // `a/b/f.rs -> a/f.rs` once keyed as `a//f.rs`.
     let r = Repo::init();
     r.write("a/b/file.rs", "one\ntwo\nthree\nfour\nfive\nsix\n");
     r.commit_all("init");
@@ -857,8 +1251,7 @@ fn untracked_paths_with_spaces_survive_verbatim() {
 
 #[test]
 fn untracked_files_in_a_new_directory_are_listed_individually() {
-    // git collapses a brand-new directory to one `dir/` entry by default; `--untracked-files=all`
-    // expands it so each new file is reviewable, not the directory.
+    // A new directory lists each file, not one `dir/` entry.
     let r = Repo::init();
     r.write("seed.rs", "x\n");
     r.commit_all("init");
@@ -874,9 +1267,44 @@ fn untracked_files_in_a_new_directory_are_listed_individually() {
 }
 
 #[test]
+fn an_untracked_files_count_follows_its_edits() {
+    let r = Repo::init();
+    r.write("seed.rs", "x\n");
+    r.commit_all("init");
+    let count = || {
+        let files = changed_from(r.path(), "HEAD").unwrap();
+        files.iter().find(|f| f.path == "notes.txt").map(|f| f.additions)
+    };
+    r.write("notes.txt", "a\nb\n");
+    assert_eq!(count(), Some(2));
+    // Rewritten at the same size within its mtime's tick: never the remembered count.
+    let at = r.path().join("notes.txt");
+    let stamp = std::fs::metadata(&at).unwrap().modified().unwrap();
+    r.write("notes.txt", "abc\n");
+    std::fs::File::options().write(true).open(&at).unwrap().set_modified(stamp).unwrap();
+    assert_eq!(count(), Some(1), "a fresh file's count was remembered");
+    r.write("notes.txt", "a\nb\nc\n");
+    assert_eq!(count(), Some(3));
+    // A settled file is counted once, then still matches after its edit.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+    std::fs::File::options().write(true).open(&at).unwrap().set_modified(old).unwrap();
+    assert_eq!(count(), Some(3));
+    r.write("notes.txt", "a\nb\nc\nd\n");
+    assert_eq!(count(), Some(4));
+    // Settled, then rewritten at its size with the old mtime put back, as `cp -p` does.
+    std::fs::File::options().write(true).open(&at).unwrap().set_modified(old).unwrap();
+    assert_eq!(count(), Some(4));
+    r.write("notes.txt", "abcdefg\n");
+    std::fs::File::options().write(true).open(&at).unwrap().set_modified(old).unwrap();
+    // Git keys on ctime too, which unix keeps and no write can set back.
+    if cfg!(unix) {
+        assert_eq!(count(), Some(1), "a restored mtime hid the rewrite");
+    }
+}
+
+#[test]
 fn a_repo_with_no_commits_lists_untracked_without_erroring() {
-    // A fresh `git init` has no HEAD; diffing against it would error and kill the process.
-    // Diffing against the empty tree lets a commitless repo list its files instead.
+    // No commits: diff against the empty tree.
     let r = Repo::init();
     r.write("fresh.rs", "one\ntwo\n");
     let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
@@ -907,7 +1335,7 @@ fn git_access_never_mutates_the_repo() {
     let status_before = r.git(&["status", "--porcelain"]);
 
     let _ = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
-    let _ = file_content(r.path(), "HEAD", "a.rs");
+    let _ = diff_sides(r.path(), "HEAD", None, "a.rs", None).unwrap();
     let _ = changed_files(r.path(), Scope::Branch, Some("main")).unwrap();
 
     assert_eq!(head_before, r.git(&["rev-parse", "HEAD"]), "HEAD unchanged");
@@ -926,8 +1354,7 @@ fn changed_against_tree_shows_edits_creates_and_deletes_since_the_snapshot() {
 
     let base = snapshot_worktree(r.path()).unwrap();
 
-    // The turn: edit a tracked file, create a new file, delete one, and leave the
-    // pre-existing untracked file untouched.
+    // The turn edits, creates, and deletes; the old untracked file stays put.
     r.write("tracked.rs", "one\nTWO\nthree\n");
     r.write("created.rs", "new\n");
     r.remove("doomed.rs");
@@ -945,8 +1372,7 @@ fn changed_against_tree_shows_edits_creates_and_deletes_since_the_snapshot() {
 
 #[test]
 fn changed_against_tree_sees_an_untracked_only_turn() {
-    // A turn whose only act is creating a new file must register as a change — the
-    // promotion path depends on this being a real diff.
+    // A turn that only creates a file is a change, which promotion relies on.
     let r = Repo::init();
     r.write("a.rs", "a\n");
     r.commit_all("init");
@@ -954,6 +1380,29 @@ fn changed_against_tree_sees_an_untracked_only_turn() {
     r.write("fresh.rs", "x\n");
     let files = changed_against_tree(r.path(), &base).unwrap();
     assert_eq!(by_path(&files)["fresh.rs"].kind, ChangeKind::Added);
+}
+
+#[test]
+fn a_snapshot_sees_a_same_size_edit_made_in_the_index_writes_own_tick() {
+    // A same-size rewrite in the index's own tick: only the index mtime makes git compare content.
+    let r = Repo::init();
+    r.git(&["config", "core.trustctime", "false"]);
+    let tick = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let set_mtime = |rel: &str| {
+        let file = std::fs::File::options().write(true).open(r.path().join(rel)).unwrap();
+        file.set_modified(tick).unwrap();
+    };
+    r.write("a.txt", "one\n");
+    set_mtime("a.txt");
+    r.commit_all("init");
+    let base = snapshot_worktree(r.path()).unwrap();
+    r.write("a.txt", "ONE\n");
+    set_mtime("a.txt");
+    set_mtime(".git/index");
+    assert_eq!(r.git(&["diff", "--name-only", "HEAD"]), "a.txt\n", "git sees the edit");
+
+    let files = changed_against_tree(r.path(), &base).unwrap();
+    assert_eq!(by_path(&files)["a.txt"].kind, ChangeKind::Modified);
 }
 
 #[test]
@@ -979,24 +1428,7 @@ fn snapshot_worktree_never_mutates_the_repo() {
     assert_eq!(r.git(&["status", "--porcelain"]), status_before, "working tree status unchanged");
     assert_eq!(r.git(&["rev-parse", "HEAD"]), head_before, "HEAD unchanged");
     assert_eq!(r.git(&["branch", "-a"]), branches_before, "no branch created");
-    assert!(!git_dir.join("reviewr-turn-index").exists(), "the temp index is cleaned up");
-}
-
-#[test]
-fn snapshot_worktree_recovers_from_a_stale_index_lock() {
-    let r = Repo::init();
-    r.write("a.rs", "x\n");
-    r.commit_all("init");
-
-    let git_dir = r.git(&["rev-parse", "--absolute-git-dir"]);
-    let git_dir = std::path::Path::new(git_dir.trim());
-    // A hard crash mid-`add` leaves git's lock on the temp index behind; a later snapshot
-    // must clear it instead of failing "Unable to create ... File exists" forever after.
-    std::fs::write(git_dir.join("reviewr-turn-index.lock"), "").unwrap();
-
-    let tree = snapshot_worktree(r.path()).unwrap();
-    assert_eq!(tree.len(), 40, "a tree object id");
-    assert!(!git_dir.join("reviewr-turn-index.lock").exists(), "the stale lock is cleared");
+    assert!(!git_dir.join("reviewr-turn-index").exists(), "no index lands in the git dir");
 }
 
 #[test]
@@ -1128,8 +1560,7 @@ fn list_ignored_dir_returns_immediate_children_only() {
 
 // --- commits scope ---------------------------------------
 
-/// `main` with three commits over the root, each touching its own file, plus `feature`
-/// with one commit. Returns the shas of the four `main` commits, root first.
+/// `main` with four commits and `feature` with one; returns `main`'s shas, root first.
 fn run_repo() -> (Repo, Vec<String>) {
     let r = Repo::init();
     r.write("root.rs", "r\n");
@@ -1212,8 +1643,7 @@ fn a_merge_commit_contributes_its_tree_change() {
     assert_eq!(rows[0].refs, [CommitRef::Tag("v1".into())], "HEAD and its branch are dropped");
     assert_eq!(rows[1].refs, [CommitRef::Branch("other".into())]);
     assert_eq!(rows[2].refs, [CommitRef::Remote("origin/main".into())]);
-    // The universe is the first-parent walk: the side branch's commit is behind the merge
-    // row, never a row of its own, so any contiguous run is one ancestor chain.
+    // The first-parent walk: a side branch's commit is no row of its own.
     let subjects: Vec<&str> = rows.iter().map(|c| c.subject.as_str()).collect();
     assert_eq!(subjects, ["merge side", "three", "two", "one", "root"]);
 }
@@ -1223,7 +1653,10 @@ fn a_shallow_cut_is_gone_not_a_root() {
     use herdr_reviewr::git::{EMPTY_TREE, commit_exists, parent_or_empty};
     let (r, shas) = run_repo();
     let shallow = tempfile::tempdir().unwrap();
-    let url = format!("file://{}", r.path().display());
+    // `file:///C:/…` on Windows, `file:///…` elsewhere.
+    let path = r.path().to_string_lossy().replace('\\', "/");
+    let url =
+        if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") };
     let out = std::process::Command::new("git")
         .args(["clone", "-q", "--depth", "1", &url, "w"])
         .current_dir(shallow.path())
@@ -1231,8 +1664,7 @@ fn a_shallow_cut_is_gone_not_a_root() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let w = shallow.path().join("w");
-    // `HEAD`'s parent is named by the commit object even though the clone lacks it, so the
-    // pick reads `gone` rather than diffing the whole tree against the empty tree.
+    // A shallow clone's missing parent reads `gone`, never the empty tree.
     let parent = parent_or_empty(&w, &shas[3]).unwrap();
     assert_eq!(parent, shas[2]);
     assert_ne!(parent, EMPTY_TREE);
@@ -1314,4 +1746,100 @@ fn the_commit_scope_writes_nothing() {
         r.git(&["write-tree"]),
     );
     assert_eq!(before, after, "no ref, index, worktree, or HEAD change");
+}
+
+/// Reading never writes the repository, a stat-dirty file included.
+#[test]
+fn reading_a_touched_file_never_rewrites_the_index() {
+    let r = Repo::init();
+    r.write("a.txt", "one\n");
+    r.write("run.sh", "x\n");
+    r.write("b.bin", "\0\u{1}binary\n");
+    r.commit_all("init");
+    let index = r.path().join(".git/index");
+    let stamp = || std::fs::metadata(&index).unwrap().modified().unwrap();
+    // A later mtime on unchanged content, past the index's own stamp.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    r.write("a.txt", "one\n");
+    r.write("b.bin", "\0\u{1}binary\n");
+    // A real mode change still lists, as an empty change.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = r.path().join("run.sh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let before = stamp();
+
+    let changed = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let paths: Vec<&str> = changed.iter().map(|f| f.path.as_str()).collect();
+    let expected: &[&str] = if cfg!(unix) { &["run.sh"] } else { &[] };
+    assert_eq!(paths, expected, "a touched file with the same content is no change");
+    diff_sides(r.path(), "HEAD", None, "a.txt", None).unwrap();
+    snapshot_worktree(r.path()).unwrap();
+
+    assert_eq!(stamp(), before, ".git/index was rewritten");
+    // reviewr's only files in .git are its index copies, in their own dir.
+    let ours: Vec<_> = std::fs::read_dir(r.path().join(".git"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("reviewr"))
+        .collect();
+    assert_eq!(ours, ["reviewr"], "reviewr left {ours:?} in .git");
+    let copies = std::fs::read_dir(r.path().join(".git/reviewr")).unwrap().flatten();
+    assert!(copies.into_iter().all(|e| e.file_name().to_string_lossy().starts_with("index-")));
+}
+
+/// A file ignored since the last snapshot leaves the next one: `add -A` never unstages.
+#[test]
+fn a_file_ignored_since_the_last_snapshot_leaves_the_next() {
+    let r = Repo::init();
+    r.write("a.txt", "a\n");
+    r.commit_all("init");
+    r.write("build.out", "x\n");
+    let listed = |tree: &str| r.git(&["ls-tree", "--name-only", tree]);
+    assert!(listed(&snapshot_worktree(r.path()).unwrap()).contains("build.out"));
+    r.write(".gitignore", "build.out\n");
+    assert!(!listed(&snapshot_worktree(r.path()).unwrap()).contains("build.out"));
+}
+
+/// An index rewritten in the same mtime tick, at the same size, is still a new index.
+#[test]
+fn an_index_rewritten_within_one_tick_is_read_again() {
+    let r = Repo::init();
+    r.write("a.txt", "one\ntwo\nthree\n");
+    r.commit_all("init");
+    r.git(&["mv", "a.txt", "y.txt"]);
+    let index = r.path().join(".git/index");
+    let stamp = std::fs::metadata(&index).unwrap().modified().unwrap();
+    let names = |files: Vec<ChangedFile>| files.into_iter().map(|f| f.path).collect::<Vec<_>>();
+    assert_eq!(names(changed_files(r.path(), Scope::Uncommitted, None).unwrap()), ["y.txt"]);
+    r.git(&["mv", "y.txt", "z.txt"]);
+    let file = std::fs::File::options().write(true).open(&index).unwrap();
+    file.set_modified(stamp).unwrap();
+    assert_eq!(names(changed_files(r.path(), Scope::Uncommitted, None).unwrap()), ["z.txt"]);
+}
+
+/// Concurrent snapshots of one worktree all land the same tree.
+#[test]
+fn concurrent_snapshots_of_one_worktree_all_land_the_same_tree() {
+    let r = Repo::init();
+    for i in 0..50 {
+        r.write(&format!("f{i}.txt"), &format!("{i}\n"));
+    }
+    r.commit_all("init");
+    r.write("f0.txt", "edited\n");
+    let path = r.path_buf();
+    let snap = |path: std::path::PathBuf| {
+        std::thread::spawn(move || (0..20).map(|_| snapshot_worktree(&path)).collect::<Vec<_>>())
+    };
+    let (a, b) = (snap(path.clone()), snap(path.clone()));
+    let trees: Vec<String> = a
+        .join()
+        .unwrap()
+        .into_iter()
+        .chain(b.join().unwrap())
+        .map(|tree| tree.expect("a snapshot failed"))
+        .collect();
+    assert!(trees.windows(2).all(|w| w[0] == w[1]), "snapshots disagree: {trees:?}");
 }

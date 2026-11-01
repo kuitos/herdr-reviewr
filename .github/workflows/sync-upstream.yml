@@ -1,15 +1,7 @@
 name: sync upstream
 
-# Fork housekeeping: once a day, look for an upstream release (a `v*` tag on
-# persiyanov/herdr-reviewr) this fork has not merged yet, and try merging it into `main`.
-#
-# - A clean merge that passes fmt, clippy and the tests opens a PR against `main`.
-# - A clean merge whose checks fail opens a draft PR, so the fix can land on its branch.
-# - A conflicting merge opens an issue listing the conflicted files.
-#
-# Nothing is merged, tagged or released automatically. The checks run here rather than on the
-# PR because a PR opened with GITHUB_TOKEN triggers no other workflow (GitHub's rule), so the
-# regular CI would never see it.
+# Fork housekeeping: merge the newest upstream `v*` tag into `main` once a day.
+# A clean passing merge opens a PR; a failing one a draft; a conflict an issue. Nothing merges itself.
 on:
   schedule:
     - cron: "17 2 * * *"
@@ -98,9 +90,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          # Both sides rewrite the same version lines (ours `X-kuitos.N`, theirs the next release),
-          # which would conflict on every sync. Align ours to upstream's version first, so both
-          # sides make the same change there, then move to `<upstream>-kuitos.1` after the merge.
+          # Align the version to upstream's first, so the shared version lines do not conflict,
+          # then move to `<upstream>-kuitos.1` after the merge.
           set_version() {
             python3 - "$1" <<'PY'
           import re, sys

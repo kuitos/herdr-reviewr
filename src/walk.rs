@@ -1,11 +1,5 @@
-//! The `All files` listing for a directory outside any git repository.
-//!
-//! Inside a repo the listing is `git::all_files` (`ls-files`). Outside one there is no index to
-//! ask, so this walks the filesystem with the same rules a repo would apply: `.gitignore` files
-//! (and the global excludes file) are honored, dotfiles are listed, `.git` never is. The result
-//! has `git::all_files`'s shape — files only, an ignored directory collapsed to one `is_dir`
-//! placeholder, sorted — so the tree, the lazy expansion (`git::list_ignored_dir`), and the
-//! viewer cannot tell the two apart.
+//! The `All files` listing outside a git repo: an `ignore` walk in `git::all_files`'s shape.
+//! `.gitignore` is honored, dotfiles list, `.git` never does, and an ignored dir is one placeholder.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -25,14 +19,8 @@ pub struct Listing {
     pub capped: bool,
 }
 
-/// Every entry under `root` for the `All files` tab, walking at most `cap` entries.
-///
-/// Files the ignore rules keep come back as themselves. A child of a walked directory that the
-/// walk neither yielded nor entered is ignored, and comes back as a placeholder the way
-/// `ls-files --others --ignored --directory` reports one: a directory as `is_dir` (skipped when
-/// empty, as `--no-empty-directory` does), a file as itself. A walk the cap stopped emits no
-/// placeholders, since a directory it stopped inside would read its unwalked children as
-/// ignored; placeholders themselves spend the same budget.
+/// Every entry under `root` for `All files`, at most `cap` entries, ignored dirs as placeholders.
+/// A walk the cap stopped emits no placeholders, since a directory it stopped inside is unfinished.
 pub fn plain_files(root: &Path, cap: usize) -> Result<Listing> {
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -131,9 +119,8 @@ mod tests {
 
     #[test]
     fn a_plain_directory_lists_like_ls_files_would() {
-        // No `.git` anywhere: the `.gitignore` still decides, dotfiles list, an ignored
-        // directory collapses to one placeholder, an ignored file lists as itself, and an
-        // empty ignored directory is skipped as `--no-empty-directory` skips it.
+        // No `.git`: `.gitignore` still decides, dotfiles list, an ignored dir is one placeholder,
+        // and an empty ignored directory is skipped as `--no-empty-directory` skips it.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(root, ".gitignore", "target/\n*.log\nempty/\n");

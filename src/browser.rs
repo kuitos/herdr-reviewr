@@ -1,8 +1,6 @@
-//! Open a URL in the user's browser — the `PR` tab's only outward action.
-//!
-//! A configured opener wins; otherwise the host platform's default is used.
+//! Open a URL in the browser: the configured `url_opener`, else the platform's default.
 
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -10,43 +8,60 @@ use anyhow::{Context, Result};
 const OPENERS: &[&str] = &["open"];
 #[cfg(target_os = "linux")]
 const OPENERS: &[&str] = &["xdg-open"];
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 const OPENERS: &[&str] = &["open", "xdg-open"];
 
-/// Open `url` through the configured `url_opener`, else the first platform opener on `PATH`.
-/// The opener runs detached from the frame: it is started and reaped on a background thread,
-/// never waited on, so a command that lingers (a browser launched in the foreground, a bridge
-/// to an unreachable host) can never freeze the pane. A command that cannot start is reported;
-/// what it does once running is its own.
+/// The first platform opener the `present` predicate accepts, in list order.
+#[cfg(not(windows))]
+fn default_tool(present: impl Fn(&str) -> bool) -> Result<&'static str> {
+    OPENERS
+        .iter()
+        .copied()
+        .find(|candidate| present(candidate))
+        .context("no link opener: install open or xdg-open, or set `url_opener`")
+}
+
+/// Open `url` with the platform's own opener, found on `PATH`.
+#[cfg(not(windows))]
+fn open_default(url: &str) -> Result<()> {
+    let tool = default_tool(crate::proc::on_path)?;
+    let mut command = crate::proc::command(tool);
+    command.arg(url);
+    spawn_detached(tool, command)
+}
+
+/// Open `url` through `ShellExecuteW`: no shell parses it.
+#[cfg(windows)]
+fn open_default(url: &str) -> Result<()> {
+    opener::open(url)
+        .map_err(|error| anyhow::anyhow!("the default browser could not start: {error}"))
+}
+
+/// Open an http(s) `url` through `url_opener`, else the platform default.
 pub fn open(url: &str, configured: Option<&str>) -> Result<()> {
-    let (tool, args, mut command) = if let Some(template) = configured {
-        let (program, args) =
-            opener_argv(template, url).context("the `url_opener` setting names no program")?;
-        let command = crate::proc::user_command(&program)
-            .with_context(|| format!("URL opener {program:?} was not found"))?;
-        (program, args, command)
-    } else {
-        let tool = OPENERS
-            .iter()
-            .copied()
-            .find(|candidate| crate::proc::on_path(candidate))
-            .context("no URL opener found: install `open`/`xdg-open`, or set `url_opener`")?;
-        (tool.to_string(), vec![url.to_string()], crate::proc::command(tool))
-    };
+    let url = openable_url(url).map_err(anyhow::Error::msg)?;
+    let Some(template) = configured else { return open_default(url) };
+    let (program, args) = opener_argv(template, url).context("`url_opener` names no program")?;
+    let mut command = crate::proc::user_command(&program)
+        .with_context(|| format!("`url_opener` not found: {program}"))?;
+    command.args(&args);
+    spawn_detached(&program, command)
+}
+
+/// Start an opener and reap it on a background thread, never waited on.
+fn spawn_detached(tool: &str, mut command: Command) -> Result<()> {
     let mut child = command
-        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| anyhow::anyhow!("URL opener {tool:?} could not start: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("{tool} could not start: {error}"))?;
     // Reaped off the frame thread, so a finished opener never lingers as a zombie.
     std::thread::spawn(move || drop(child.wait()));
     Ok(())
 }
 
-/// The configured opener's program and arguments: `template` split the way the `editor` key
-/// is, `{url}` substituted per word — so a URL never splits — and appended when absent.
+/// The configured opener's argv: `template` split like `editor`, `{url}` placed or appended.
 fn opener_argv(template: &str, url: &str) -> Option<(String, Vec<String>)> {
     let names_url = template.contains("{url}");
     let mut words =
@@ -59,10 +74,7 @@ fn opener_argv(template: &str, url: &str) -> Option<(String, Vec<String>)> {
     Some((program, args))
 }
 
-/// Gate a markdown link destination before it reaches the OS opener
-/// : trimmed, case-insensitive `http://`/`https://` with something
-/// after the scheme, and no control or bidirectional-override character anywhere — a
-/// destination the display would sanitize must never open as different bytes.
+/// A link the OS opener may take: http(s) with something after the scheme, and no character the display would hide.
 pub fn openable_url(url: &str) -> Result<&str, &'static str> {
     let trimmed = url.trim();
     let hostile = trimmed.chars().any(crate::markdown::hostile_char);
@@ -74,12 +86,30 @@ pub fn openable_url(url: &str) -> Result<&str, &'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
+    use super::default_tool;
     use super::{open, openable_url, opener_argv};
 
     #[test]
     fn a_configured_opener_that_cannot_start_is_reported_never_replaced() {
         let error = open("https://x.dev", Some("reviewr-no-such-opener {url}")).unwrap_err();
         assert!(error.to_string().contains("reviewr-no-such-opener"), "{error}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_default_opener_is_the_first_one_on_path_and_its_absence_says_what_to_install() {
+        let all = |_: &str| true;
+        #[cfg(target_os = "macos")]
+        assert_eq!(default_tool(all).unwrap(), "open");
+        #[cfg(target_os = "linux")]
+        assert_eq!(default_tool(all).unwrap(), "xdg-open");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert_eq!(default_tool(all).unwrap(), "open");
+        assert_eq!(
+            default_tool(|_| false).unwrap_err().to_string(),
+            "no link opener: install open or xdg-open, or set `url_opener`"
+        );
     }
 
     #[test]

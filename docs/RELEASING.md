@@ -2,18 +2,21 @@
 
 How to cut a herdr-reviewr release. A `v*` tag push is the trigger: `.github/workflows/release.yml`
 creates the GitHub Release and uploads a prebuilt binary per target, and `herdr/install.sh`
-downloads the matching asset on `herdr plugin install`.
+(`herdr/install.ps1` on Windows) downloads the matching asset on `herdr plugin install`.
 
 ## The one rule
 
-**The manifest version and the tag must match.** `herdr/install.sh` reads `version` from
-`herdr-plugin.toml`, sets `TAG="v${version}"`, and downloads from
-`releases/download/${TAG}/`. A `0.2.0` manifest needs a `v0.2.0` tag, or installs 404.
+**The manifest version and the tag must match.** Both install scripts read `version` from
+`herdr-plugin.toml`, set the tag to `v<version>`, and download from
+`releases/download/<tag>/`. A `0.2.0` manifest needs a `v0.2.0` tag, or installs 404.
 
 Two files carry the version — keep them equal:
 
 - `Cargo.toml` → `[package] version`
 - `herdr-plugin.toml` → `version`
+
+A manifest change that needs a new binary (a new action, a new flag) lands in the same push as
+its release, or installs from `main` run the new manifest on the old binary.
 
 ## Steps
 
@@ -39,7 +42,7 @@ Pick the new version with semver: a behavior change or new feature is a minor bu
 
    ```bash
    gh run watch                  # the release.yml run for the tag
-   gh release view vX.Y.Z        # four <target>.tar.gz + .sha256 sidecars
+   gh release view vX.Y.Z        # four <target>.tar.gz, one Windows .zip, a .sha256 each
    ```
 
 ## What the tag triggers
@@ -50,8 +53,10 @@ Pick the new version with semver: a behavior change or new feature is a minor bu
   (`taiki-e/create-gh-release-action`). A tag with no matching changelog section fails the
   release — finalize the changelog before tagging;
 - builds `herdr-reviewr` for `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-  `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`;
-- uploads each as `herdr-reviewr-<target>.tar.gz` with a `.sha256` sidecar;
+  `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`;
+- uploads each as `herdr-reviewr-<target>.tar.gz` with a `herdr-reviewr-<target>.sha256` sidecar.
+  Windows is `herdr-reviewr-x86_64-pc-windows-msvc.zip` with
+  `herdr-reviewr-x86_64-pc-windows-msvc.sha256`. ARM64 Windows installs the x64 build;
 - publishes the draft only after every target's assets attached. The repo's releases are
   immutable — assets cannot be added after publish — so publish is the last step, and a
   failed target leaves an editable draft instead of a sealed, assetless release.
@@ -99,6 +104,6 @@ end-to-end test: it exercises the exact `herdr plugin install` path a user hits.
 - **QA against the installed plugin** uses `just qa-install`, never a bare `cp`. Overwriting the
   installed binary in place invalidates its cached code signature, macOS SIGKILLs every launch,
   and the pane opens dead with no error — the recipe replaces the inode and ad-hoc re-signs.
-  `just qa-restore` puts the released binary back.
+  `just qa-restore` puts the released binary and manifest back.
 - **`--verify-tag`** means the tag must exist on the remote before the Release is created — push
   the tag, don't create the Release by hand first.

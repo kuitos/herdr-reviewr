@@ -1,9 +1,5 @@
-//! A live resolution probe against a real worktree and real `gh`, for manual
-//! verification only — never part of the suite. Run it as:
-//!
-//! ```sh
-//! REVIEWR_LIVE_REPO=/path/to/worktree cargo test --test pr_live -- --ignored --nocapture
-//! ```
+//! A manual probe against a real worktree and `gh`, never part of the suite:
+//! `REVIEWR_LIVE_REPO=<worktree> cargo test --test pr_live -- --ignored --nocapture`.
 
 use herdr_reviewr::config::PluginConfig;
 use herdr_reviewr::forge::{fetch, fetch_input};

@@ -16,9 +16,10 @@ fmt-check:
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
 
-# run the test suite
+# run the test suite, cut off from the herdr it may run inside: a test that reaches `herdr`
+# gets a binary that refuses and no socket, never a live agent pane
 test:
-    cargo test --all-features
+    env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false cargo test --all-features
 
 # build (debug)
 build:
@@ -39,19 +40,16 @@ qa-install:
     cargo build --release
     ./scripts/qa-install.sh
 
-# restore the released binary the last `just qa-install` replaced
+# restore the released binary and manifest the last `just qa-install` replaced
 qa-restore:
-    #!/usr/bin/env sh
-    set -eu
-    bin="$(ls -d "$HOME"/.config/herdr/plugins/github/persiyanov.reviewr-*/bin/herdr-reviewr | head -1)"
-    ./scripts/swap-binary.sh "$bin.release-backup" "$bin"
-    echo "restored release binary at $bin"
+    ./scripts/qa-install.sh --restore
 
 # PTY smoke test of the editor path against a real release binary
 smoke-edit:
     cargo build --release
     python3 scripts/smoke_edit_file.py --binary target/release/herdr-reviewr
 
-# everything CI runs, locally
+# everything the unix CI job runs, locally (the Windows jobs run on CI only)
 ci: fmt-check lint test
     cargo build --release
+    python3 scripts/idle_check.py --binary target/release/herdr-reviewr
