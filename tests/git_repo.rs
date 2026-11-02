@@ -8,9 +8,9 @@ use std::path::Path;
 use common::Repo;
 use herdr_reviewr::git::{
     DiffSides, ResolvedBase, abbreviate_oid, all_files, changed_between, changed_from,
-    checked_out_branch, default_branch_name, delete_base_pick, diff_sides, list_branches,
-    merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base, resolve_commit,
-    snapshot_worktree, write_base_pick, write_baseline_ref,
+    checked_out_branch, default_branch_name, delete_base_pick, diff_sides, head_and_branch,
+    list_branches, merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base,
+    resolve_commit, snapshot_worktree, write_base_pick, write_baseline_ref,
 };
 use herdr_reviewr::model::{ChangeKind, ChangedFile, Scope};
 use herdr_reviewr::world::{WorldInput, build_changed};
@@ -864,6 +864,26 @@ fn list_branches_merges_names_newest_first_and_lists_the_checked_out() {
     assert_eq!(names(&rows), ["feature", "newer", "main", "older"]);
     assert_eq!(rows.iter().find(|r| r.name == "main").unwrap().tip_secs, by_name("main"));
     assert_eq!(checked_out_branch(r.path()).unwrap().as_deref(), Some("feature"));
+}
+
+#[test]
+fn head_and_branch_reads_the_commit_and_the_branch_as_the_picker_names_it() {
+    let r = Repo::init();
+    assert_eq!(head_and_branch(r.path()), (None, Some("main".into())), "unborn: the branch alone");
+    r.write("a.rs", "1\n");
+    r.commit_all("one");
+    let head = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["tag", "main"]);
+    let expected = (Some(head.clone()), Some("main".to_string()));
+    assert_eq!(head_and_branch(r.path()), expected, "a tag of the same name changes nothing");
+    let branch = checked_out_branch(r.path()).unwrap();
+    assert_eq!(branch.as_deref(), Some("main"), "nor for the PR lookup and the base picker");
+    r.git(&["checkout", "-q", "-b", "worktree/lucky-meadow-02ec"]);
+    r.write("HEAD", "a file named HEAD\n");
+    let expected = (Some(head.clone()), Some("worktree/lucky-meadow-02ec".to_string()));
+    assert_eq!(head_and_branch(r.path()), expected, "a `/` branch, beside a file named HEAD");
+    r.git(&["checkout", "-q", "--detach"]);
+    assert_eq!(head_and_branch(r.path()), (Some(head), None), "detached: the commit alone");
 }
 
 #[test]

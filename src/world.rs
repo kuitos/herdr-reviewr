@@ -30,7 +30,7 @@ pub struct WorldInput {
 }
 
 /// One refresh's result; the base rides along so the header and its changeset land together.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WorldSnapshot {
     pub changeset: Changeset,
     pub entries: Vec<Entry>,
@@ -39,6 +39,8 @@ pub struct WorldSnapshot {
     pub pick_status: Option<PickStatus>,
     /// `HEAD` at build time, the commit picker's key; `None` when unborn.
     pub head: Option<String>,
+    /// What the worktree has checked out: its branch, or `detached <sha>`; `None` when unread.
+    pub checkout: Option<String>,
     /// The paths a path-limited build re-read; `None` for a full build, which re-read everything.
     pub touched: Option<BTreeSet<String>>,
     /// Whether the reviewed directory was a git worktree when the build ran. Decided every
@@ -113,7 +115,7 @@ pub struct ScopeBuild {
     pub changeset: Changeset,
 }
 
-/// Build the snapshot for `input`; the changeset is built on every tab.
+/// Build the snapshot for `input`: the changeset on a file tab, the checkout alone on `PR`.
 /// A plain directory walks `All files` with an empty changeset; git that cannot run fails the build.
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
     let Some(repo_kind) = RepoKind::of(&input.repo) else {
@@ -130,18 +132,22 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
             branch_base: git::BaseStatus::default(),
             pick_status: None,
             head: None,
+            checkout: None,
             touched: None,
             repo_kind,
             listing_capped,
         });
     }
-    // One read of HEAD serves the snapshot and the uncommitted diff's old end.
-    let head = git::head_oid(&input.repo);
+    // One read of HEAD serves the snapshot, the footer, and the uncommitted diff's old end.
+    let (head, branch) = git::head_and_branch(&input.repo);
+    let checkout = git::checkout_name(branch, head.as_deref());
+    if !input.tab.is_file_tab() {
+        return Ok(WorldSnapshot { head, checkout, repo_kind, ..WorldSnapshot::default() });
+    }
     let ScopeBuild { branch_base, pick_status, changeset } = scope_build(input, head.clone())?;
     let (entries, listing_capped) = match input.tab {
         // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
         Tab::AllFiles => all_files_entries(input, repo_kind, &changeset.files)?,
-        // `Changes` (the `PR` tab never builds a snapshot).
         _ => (changeset.files.values().map(Entry::from_changed).collect(), false),
     };
     Ok(WorldSnapshot {
@@ -150,6 +156,7 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
         branch_base,
         pick_status,
         head,
+        checkout,
         touched: None,
         repo_kind,
         listing_capped,
@@ -404,6 +411,7 @@ fn merge_paths(
         branch_base: last.branch_base.clone(),
         pick_status: last.pick_status.clone(),
         head: last.head.clone(),
+        checkout: last.checkout.clone(),
         touched: Some(paths.clone()),
         repo_kind: last.repo_kind,
         listing_capped: last.listing_capped,
@@ -519,9 +527,12 @@ pub fn spawn(
     rx: Receiver<WorldJob>,
     tx: crate::wake::Sender<WorldCompletion>,
 ) -> std::thread::JoinHandle<()> {
+    // Taken before the spawn: a switch can leave this worker finishing a build after its loop let go.
+    let session = git::lease_session(&repo);
     std::thread::Builder::new()
         .name("world".into())
         .spawn(move || {
+            let _session = session;
             git::sweep_dead_copies(&repo);
             let mut worker = Worker::default();
             while let Ok(mut job) = rx.recv() {
@@ -534,7 +545,8 @@ pub fn spawn(
                 let snapshot = if job.input.tab.is_file_tab() {
                     worker.refresh(&job.input, job.refresh.clone())
                 } else {
-                    None
+                    // `PR` reads only the checkout, which a worktree batch never moves.
+                    job.refresh.is_full().then(|| build(&job.input))
                 };
                 let done = WorldCompletion {
                     generation: job.generation,

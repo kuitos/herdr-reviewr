@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.0-kuitos.1] - 2026-11-02
+
+Fork of persiyanov/herdr-reviewr v0.49.0. The fork's review features from 0.48.0-kuitos.1 are
+carried onto this release: a directory that is not a git repository, character-level comments,
+and `deliver = "immediate"`.
+
+### Changed
+- **A batch review names its worktree**, from upstream. An immediate paste, and leftovers sent
+  with `s`, stay quotes (`> path:12「text」`). A dialog on the agent's screen still refuses the send.
+- **Windows install** downloads this fork's release, as the Unix installer does.
+- **`W` switches the reviewed worktree**, from upstream, in the same pane.
+
 ## [0.48.0-kuitos.1] - 2026-11-01
 
 Fork of persiyanov/herdr-reviewr v0.48.0. The fork's own review features are carried onto this
@@ -76,6 +88,22 @@ Fork of persiyanov/herdr-reviewr v0.39.0.
   `blocked` on a confirmation, or its screen shows a dialog's `Enter … Esc` key hints (Codex's
   model picker reports `idle`), reviewr writes nothing and keeps your comments instead of
   typing them into the dialog. ([#86](https://github.com/persiyanov/herdr-reviewr/issues/86))
+## [0.49.0] — 2026-10-29
+
+### Added
+- **Worktree switch**: `W` lists this repo's worktrees, and a pick reviews that one in the same pane until it closes.
+  Thanks [@cajames](https://github.com/cajames) ([#152](https://github.com/persiyanov/herdr-reviewr/pull/152)) and [@jmoreno-blr](https://github.com/jmoreno-blr) ([#115](https://github.com/persiyanov/herdr-reviewr/issues/115)).
+- **Breaking: `W` is a new default key.** A `[keybindings]` config that already uses `W` now collides and must move it.
+
+### Changed
+- **Every review names its worktree**: a send or copy carries `Worktree: <path>` after `review_prefix`, ahead of the comments.
+- **Footer**: the worktree on screen, as `folder · branch` (once when they match), closes the row at the right, and `?` moves to the left.
+- **Last turn** follows this workspace's agents when none works in the reviewed worktree, so a switched pane still tracks turns.
+
+### Fixed
+- **A branch that shares a tag's name** reads as itself, not `heads/<name>`, in the PR tab and the base picker.
+- **Emoji in the footer** count by their columns, so a long status no longer runs past the edge.
+
 ## [0.48.0] — 2026-10-19
 
 ### Added

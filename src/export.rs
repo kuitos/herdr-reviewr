@@ -1,6 +1,8 @@
 //! Comments formatted as location (and a quote), snippet, text, and exported; consume on `Ok`.
 //! A review prefix heads every batch and every immediate-delivery quote.
 
+use std::path::Path;
+
 use anyhow::Result;
 
 use crate::herdr;
@@ -57,8 +59,8 @@ pub fn format_quotes(prefix: Option<&str>, comments: &[&Comment]) -> String {
     }
 }
 
-/// The exported review: the trimmed prefix, then comments by file and start line, a blank line between.
-pub fn format_review(prefix: Option<&str>, comments: &[&Comment]) -> String {
+/// The exported review: the trimmed prefix, its worktree, then comments by file and line.
+pub fn format_review(prefix: Option<&str>, worktree: &Path, comments: &[&Comment]) -> String {
     let mut sorted = comments.to_vec();
     sorted.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
     let prefix = prefix
@@ -66,6 +68,7 @@ pub fn format_review(prefix: Option<&str>, comments: &[&Comment]) -> String {
         .filter(|text| !text.is_empty());
     prefix
         .into_iter()
+        .chain([format!("Worktree: {}", worktree.display())])
         .chain(sorted.iter().map(|c| format_comment(c)))
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -75,8 +78,8 @@ pub fn format_review(prefix: Option<&str>, comments: &[&Comment]) -> String {
 pub trait ExportTarget {
     fn export(&self, text: &str) -> Result<()>;
     /// The text this destination receives for `comments`, the review prefix above it.
-    fn format(&self, prefix: Option<&str>, comments: &[&Comment]) -> String {
-        format_review(prefix, comments)
+    fn format(&self, prefix: Option<&str>, worktree: &Path, comments: &[&Comment]) -> String {
+        format_review(prefix, worktree, comments)
     }
     fn label(&self) -> &'static str;
     /// Destination-specific confirmation shown after a successful export.
@@ -239,8 +242,12 @@ impl ExportTarget for Agent {
         )
     }
 
-    fn format(&self, prefix: Option<&str>, comments: &[&Comment]) -> String {
-        if self.quote { format_quotes(prefix, comments) } else { format_review(prefix, comments) }
+    fn format(&self, prefix: Option<&str>, worktree: &Path, comments: &[&Comment]) -> String {
+        if self.quote {
+            format_quotes(prefix, comments)
+        } else {
+            format_review(prefix, worktree, comments)
+        }
     }
 
     /// An agent at a prompt refuses: the picker's rows can be minutes old.
@@ -435,18 +442,25 @@ mod tests {
         let b = comment("b.rs", Side::New, 5, 5, "+x", "two");
         let a2 = comment("a.rs", Side::New, 20, 20, "+y", "later");
         let a1 = comment("a.rs", Side::New, 3, 3, "+z", "earlier");
-        let out = format_review(None, &[&b, &a2, &a1]);
-        assert_eq!(out, "a.rs:3\n+z\nearlier\n\na.rs:20\n+y\nlater\n\nb.rs:5\n+x\ntwo");
+        let out = format_review(None, WT.as_ref(), &[&b, &a2, &a1]);
+        assert_eq!(
+            out,
+            "Worktree: /src/pages\n\na.rs:3\n+z\nearlier\n\na.rs:20\n+y\nlater\n\nb.rs:5\n+x\ntwo"
+        );
     }
+
+    const WT: &str = "/src/pages";
 
     #[test]
     fn the_prefix_heads_the_review_with_its_blank_lines_but_not_its_trailing_space() {
         let a = comment("a.rs", Side::New, 3, 3, "+z", "rename");
         assert_eq!(
-            format_review(Some("/fix {all}\r\n\n  then test \n\n"), &[&a]),
-            "/fix {all}\n\n  then test\n\na.rs:3\n+z\nrename"
+            format_review(Some("/fix {all}\r\n\n  then test \n\n"), WT.as_ref(), &[&a]),
+            "/fix {all}\n\n  then test\n\nWorktree: /src/pages\n\na.rs:3\n+z\nrename"
         );
-        assert_eq!(format_review(None, &[&a]), "a.rs:3\n+z\nrename");
-        assert_eq!(format_review(Some(" \r\n"), &[&a]), "a.rs:3\n+z\nrename");
+        let bare = format_review(None, WT.as_ref(), &[&a]);
+        assert_eq!(bare, "Worktree: /src/pages\n\na.rs:3\n+z\nrename");
+        let blank = format_review(Some(" \r\n"), WT.as_ref(), &[&a]);
+        assert_eq!(blank, "Worktree: /src/pages\n\na.rs:3\n+z\nrename");
     }
 }

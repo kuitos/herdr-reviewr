@@ -364,10 +364,10 @@ fn open(
     let managed: Vec<PathBuf> = herdr::managed_plugin_dirs()
         .unwrap_or_default()
         .into_iter()
-        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
+        .map(|dir| crate::git::canonical(&dir))
         .collect();
     let in_plugin = |dir: &str| {
-        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
+        let dir = crate::git::canonical(Path::new(dir));
         managed.iter().any(|plugin| dir.starts_with(plugin))
     };
     // A git worktree wins; otherwise any existing directory opens. A plugin checkout refuses.
