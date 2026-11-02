@@ -1,6 +1,6 @@
 [package]
 name = "herdr-reviewr"
-version = "0.48.0-kuitos.1"
+version = "0.49.0-kuitos.1"
 edition = "2024"
 rust-version = "1.97"
 description = "A terminal review pane for herdr: browse an agent's changes and send comments back to chat."
@@ -47,6 +47,8 @@ tempfile = "3"
 time = { version = "0.3", features = ["parsing"] }
 toml = "1.1"
 two-face = "0.5.2"
+# Already in the tree through ratatui. Cuts a name's head by display width, graphemes whole.
+unicode-truncate = "2.0.1"
 unicode-width = "0.2"
 # Program lookup the way a shell does it: the executable bit on unix, PATHEXT on Windows
 # (so `az` finds `az.cmd`), and never the current directory for a bare name.
@@ -104,6 +106,10 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
 too_many_lines = "allow"
+
+# unicode-width 0.2 trips unicode-truncate's width assert on Arabic lam-alef; release drops it, so dev does too.
+[profile.dev.package.unicode-truncate]
+debug-assertions = false
 
 [profile.release]
 strip = true

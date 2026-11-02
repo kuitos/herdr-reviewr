@@ -124,11 +124,18 @@ pub fn worktree_of(path: &Path) -> Worktree {
 
 /// The worktree's own git dir and the common dir, canonical; the same in a main checkout.
 pub fn git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
-    let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"]).ok()?;
-    let mut lines = out.lines();
-    let dir = PathBuf::from(lines.next()?);
-    let common = repo.join(lines.next()?);
+    let (dir, common) = dirs(repo).ok()?;
     Some((dir.canonicalize().ok()?, common.canonicalize().ok()?))
+}
+
+/// The worktree's own git dir and the common dir, as one `rev-parse` names them.
+fn dirs(repo: &Path) -> Result<(PathBuf, PathBuf)> {
+    let out = git(repo, &["rev-parse", "--absolute-git-dir", "--git-common-dir"])?;
+    let mut lines = out.lines();
+    let (Some(dir), Some(common)) = (lines.next(), lines.next()) else {
+        bail!("git rev-parse named no git dir in {}", repo.display());
+    };
+    Ok((PathBuf::from(dir), repo.join(common)))
 }
 
 /// The global ignore file git reads: `core.excludesFile`, else git's default under the XDG dir.
@@ -844,7 +851,75 @@ pub fn list_branches(repo: &Path) -> Result<Vec<BranchRow>, GitFail> {
 
 /// The checked-out branch's bare name, `None` when `HEAD` is detached.
 pub fn checked_out_branch(repo: &Path) -> Result<Option<String>, GitFail> {
-    git_tristate(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    Ok(git_tristate(repo, &["symbolic-ref", "--quiet", "HEAD"])?.as_deref().and_then(branch_name))
+}
+
+/// A branch ref's bare name; git's short form reads `heads/main` beside a tag `main`.
+fn branch_name(full: &str) -> Option<String> {
+    full.strip_prefix("refs/heads/").map(str::to_string)
+}
+
+/// `path` as the OS resolves it, so two spellings of one directory compare equal.
+pub fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// One worktree of this clone: where it is, its `HEAD`, and its branch when one is checked out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkout {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// The worktrees of the clone at canonical `common`, minus the bare, the prunable and the unlocatable.
+pub fn worktrees(common: &Path, known: &[&Path]) -> Result<Vec<Checkout>, GitFail> {
+    // No `-z`: it needs git 2.36, and the line form is the same fields.
+    let listed = parse_worktrees(&git_strict(common, &["worktree", "list", "--porcelain"])?);
+    // A submodule, `--separate-git-dir` or a symlinked `.git` lists its main worktree as the git dir.
+    let locate = |mut c: Checkout| {
+        if canonical(&c.path) == common {
+            let own = known.iter().find(|k| git_dirs(k).is_some_and(|(own, _)| own == common));
+            c.path = own.map(|k| k.to_path_buf()).or_else(|| toplevel(&c.path))?;
+        }
+        Some(c)
+    };
+    Ok(listed.into_iter().filter_map(locate).collect())
+}
+
+/// How a checkout reads: its branch, else `detached <short sha>`.
+pub fn checkout_name(branch: Option<String>, head: Option<&str>) -> Option<String> {
+    branch.or_else(|| head.map(|h| format!("detached {}", abbreviate_oid(h))))
+}
+
+/// Read `git worktree list --porcelain`: a field per line, a blank line ending each record.
+fn parse_worktrees(out: &str) -> Vec<Checkout> {
+    let mut rows = Vec::new();
+    let mut record: Option<(Checkout, bool)> = None;
+    for field in out.lines() {
+        let (key, value) = field.split_once(' ').unwrap_or((field, ""));
+        match (key, record.as_mut()) {
+            ("", _) => {
+                if let Some((entry, false)) = record.take() {
+                    rows.push(entry);
+                }
+            }
+            ("worktree", _) => {
+                let entry = Checkout { path: PathBuf::from(value), head: None, branch: None };
+                record = Some((entry, false));
+            }
+            ("HEAD", Some((entry, _))) => entry.head = Some(value.to_string()),
+            ("branch", Some((entry, _))) => {
+                entry.branch = branch_name(value);
+            }
+            ("bare" | "prunable", Some((_, skip))) => *skip = true,
+            _ => {}
+        }
+    }
+    if let Some((entry, false)) = record {
+        rows.push(entry);
+    }
+    rows
 }
 
 /// The `origin` remote-tracking tips as `(OID, bare name)`, `origin/HEAD` excluded.
@@ -1500,7 +1575,7 @@ static OWN_REF_WRITES: Mutex<Vec<(PathBuf, &str, Option<String>)>> = Mutex::new(
 /// Note this process's write to the private ref `name` of `repo`, keyed by its canonical git dir.
 fn record_own_ref(repo: &Path, name: &'static str, value: Option<&str>) {
     let Ok(dir) = git_dir(repo) else { return };
-    let dir = dir.canonicalize().unwrap_or(dir);
+    let dir = canonical(&dir);
     let mut writes = OWN_REF_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
     writes.retain(|(d, written, _)| !(*d == dir && *written == name));
     writes.push((dir, name, value.map(str::to_string)));
@@ -1849,6 +1924,11 @@ fn git_dir(repo: &Path) -> Result<PathBuf> {
     Ok(session(repo)?.git_dir.clone())
 }
 
+/// `repo`'s canonical common dir, asked once per worktree like its git dir; `None` outside a repo.
+pub fn common_dir(repo: &Path) -> Option<PathBuf> {
+    Some(session(repo).ok()?.common_dir.clone())
+}
+
 /// What reviewr keeps about one worktree for the session: its git dir, its index copy, its last
 /// build's untracked counts, and the blob sizes it has asked for.
 #[derive(Default)]
@@ -1856,6 +1936,8 @@ struct RepoSession {
     /// What `<repo>/.git` held when the git dir was read: a linked worktree's pointer, else `None`.
     pointer: Option<String>,
     git_dir: PathBuf,
+    /// The clone's common dir, canonical: the worktree picker lists from it.
+    common_dir: PathBuf,
     copy: Mutex<Option<IndexCopy>>,
     /// Where the session copy's index file lives, so a snapshot seeds from it without its lock.
     copy_file: Mutex<Option<PathBuf>>,
@@ -1863,35 +1945,67 @@ struct RepoSession {
     sizes: Mutex<HashMap<String, u64>>,
 }
 
-/// Every live session by worktree.
-static SESSIONS: OnceLock<Mutex<HashMap<PathBuf, Arc<RepoSession>>>> = OnceLock::new();
+/// Every live session by worktree, and how many leases hold each worktree's.
+#[derive(Default)]
+struct Sessions {
+    live: HashMap<PathBuf, Arc<RepoSession>>,
+    leases: HashMap<PathBuf, usize>,
+}
+
+static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
+
+fn sessions() -> std::sync::MutexGuard<'static, Sessions> {
+    SESSIONS.get_or_init(Mutex::default).lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// `repo`'s session, made on first use and again when `.git` points elsewhere (a re-added worktree).
 fn session(repo: &Path) -> Result<Arc<RepoSession>> {
-    let sessions = SESSIONS.get_or_init(Mutex::default);
     let pointer = std::fs::read_to_string(repo.join(".git")).ok();
     let current = |s: &&Arc<RepoSession>| s.pointer == pointer;
-    if let Some(found) =
-        sessions.lock().unwrap_or_else(PoisonError::into_inner).get(repo).filter(current)
-    {
+    if let Some(found) = sessions().live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
     }
-    let git_dir = PathBuf::from(git(repo, &["rev-parse", "--absolute-git-dir"])?.trim());
-    let mut sessions = sessions.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(found) = sessions.get(repo).filter(current) {
+    let (git_dir, common_dir) = dirs(repo)?;
+    let common_dir = canonical(&common_dir);
+    let mut sessions = sessions();
+    if let Some(found) = sessions.live.get(repo).filter(current) {
         return Ok(Arc::clone(found));
     }
-    let made = RepoSession { pointer, git_dir, ..RepoSession::default() };
+    let made = RepoSession { pointer, git_dir, common_dir, ..RepoSession::default() };
     let made = Arc::new(made);
-    sessions.insert(repo.to_path_buf(), Arc::clone(&made));
+    sessions.live.insert(repo.to_path_buf(), Arc::clone(&made));
     Ok(made)
 }
 
-/// Drop every session, so each index copy no other thread holds leaves the git dir now.
-pub fn end_sessions() {
-    if let Some(sessions) = SESSIONS.get() {
-        sessions.lock().unwrap_or_else(PoisonError::into_inner).clear();
+/// A hold on `repo`'s session for as long as its holder runs git there; the last one ends it.
+#[must_use]
+#[derive(Debug)]
+pub struct SessionLease(PathBuf);
+
+pub fn lease_session(repo: &Path) -> SessionLease {
+    *sessions().leases.entry(repo.to_path_buf()).or_default() += 1;
+    SessionLease(repo.to_path_buf())
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let mut sessions = sessions();
+        let Some(held) = sessions.leases.get_mut(&self.0) else { return };
+        *held -= 1;
+        if *held == 0 {
+            sessions.leases.remove(&self.0);
+            // Dropped outside the lock: an index copy's removal is file work.
+            let ended = sessions.live.remove(&self.0);
+            drop(sessions);
+            drop(ended);
+        }
     }
+}
+
+/// Drop every session at exit, so each index copy no other thread holds leaves the git dir now.
+pub fn end_sessions() {
+    let ended = std::mem::take(&mut *sessions());
+    drop(ended);
 }
 
 /// The persisted turn baseline tree for this worktree, if a baseline exists.
@@ -1975,6 +2089,16 @@ pub fn parent_or_empty(repo: &Path, sha: &str) -> Option<String> {
 /// `HEAD`'s commit, `None` while unborn.
 pub fn head_oid(repo: &Path) -> Option<String> {
     git_line(repo, &["rev-parse", "--verify", "-q", "HEAD"])
+}
+
+/// `HEAD`'s commit and branch in one read: a detached `HEAD` has no branch, an unborn one no commit.
+pub fn head_and_branch(repo: &Path) -> (Option<String>, Option<String>) {
+    let Some(out) = git_line(repo, &["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"]) else {
+        return (None, checked_out_branch(repo).ok().flatten());
+    };
+    let mut lines = out.lines();
+    let head = lines.next().map(str::to_string);
+    (head, lines.next().and_then(branch_name))
 }
 
 /// `sha`'s subject line, for the header paint.
@@ -2520,6 +2644,31 @@ mod tests {
     };
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
+
+    #[test]
+    fn worktree_listing_keeps_checkouts_and_drops_bare_and_prunable() {
+        let out = concat!(
+            "worktree /r\nHEAD aaa\nbranch refs/heads/main\n\n",
+            "worktree /bare\nbare\n\n",
+            "worktree /w/detached\nHEAD bbb\ndetached\n\n",
+            "worktree /tmp/gone\nHEAD ddd\nbranch refs/heads/old\nprunable gitdir points nowhere\n\n",
+            // The last record, with no blank line after it.
+            "worktree /w/locked\nHEAD ccc\nbranch refs/heads/feat/x\nlocked why\n",
+        );
+        let rows = super::parse_worktrees(out);
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|r| (r.path.to_str().unwrap(), r.head.as_deref(), r.branch.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("/r", Some("aaa"), Some("main")),
+                ("/w/detached", Some("bbb"), None),
+                ("/w/locked", Some("ccc"), Some("feat/x")),
+            ]
+        );
+    }
 
     #[test]
     fn a_path_limited_build_merges_untracked_counts_and_never_shrinks_them() {

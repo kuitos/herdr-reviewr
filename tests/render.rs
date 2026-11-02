@@ -717,6 +717,11 @@ fn footer_line(out: &str) -> String {
     out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string()
 }
 
+/// Whether a footer row opens with the `?` that lists every key.
+fn opens_with_more(row: &str) -> bool {
+    row.starts_with(" ?")
+}
+
 /// Focus the diff on its first changed line.
 fn on_changed_line(app: &mut App) {
     app.focus = Focus::Diff;
@@ -760,23 +765,23 @@ fn the_footer_shows_the_action_for_the_context() {
 #[test]
 fn the_footer_trims_trailing_actions_to_fit_keeping_the_primary_and_the_more_hint() {
     let mut app = edited_app();
-    on_changed_line(&mut app); // diff focus, content line → c comment · v select … ?
-    // Wide: every cursor action fits, and the `?` closes the row.
+    on_changed_line(&mut app); // diff focus, content line → ? · c comment · v select …
+    // Wide: every cursor action fits, and the `?` opens the row.
     let wide = footer_line(&render_at(&app, 120));
     assert!(
-        wide.contains("c comment") && wide.contains("v select") && wide.trim_end().ends_with('?'),
+        wide.contains("c comment") && wide.contains("v select") && opens_with_more(&wide),
         "wide footer shows all actions and the `?`:\n{wide}"
     );
-    // Narrow: the primary survives, the trailing action drops, and the `?` stays at the right.
+    // Narrow: the primary survives, the trailing action drops, and the `?` stays at the left.
     let narrow = footer_line(&render_at(&app, 18));
     assert!(narrow.contains("c comment"), "the primary action is never dropped:\n{narrow}");
-    assert!(narrow.trim_end().ends_with('?'), "the `?` never drops:\n{narrow}");
+    assert!(opens_with_more(&narrow), "the `?` never drops:\n{narrow}");
     assert!(!narrow.contains("v select"), "the trailing action is trimmed off row 1:\n{narrow}");
     // Too narrow: the primary sheds its label and the `?` survives.
     let tiny = footer_line(&render_at(&app, 11));
     assert!(tiny.contains(" c "), "the primary keeps its key:\n{tiny}");
     assert!(!tiny.contains("comment"), "the primary sheds its label:\n{tiny}");
-    assert!(tiny.trim_end().ends_with('?'), "the `?` still survives:\n{tiny}");
+    assert!(opens_with_more(&tiny), "the `?` still survives:\n{tiny}");
 }
 
 #[test]
@@ -788,11 +793,19 @@ fn a_narrow_row_keeps_send_and_the_more_hint_by_shedding_the_primary_label() {
         app.input_push(ch);
     }
     app.submit_comment(); // a written comment adds `s send 1` to row 1
-    // The primary sheds its label so `send` and `?` never clip.
+    // The primary sheds its label, and `?` its separator, so the key, `send` and `?` never clip.
     let narrow = footer_line(&render_at(&app, 16));
-    assert!(narrow.contains("s send 1"), "send never drops:\n{narrow}");
-    assert!(narrow.trim_end().ends_with('?'), "the `?` never drops:\n{narrow}");
-    assert!(narrow.chars().count() <= 16, "the row never overflows its width:\n{narrow}");
+    assert_eq!(narrow, " ? e · s send 1 ", "the row at 16 columns");
+    // The label outranks the separator, and a row with no column for the key leaves it out.
+    let rows = [
+        (14, " ? · s send 1 "),
+        (20, " ? e edit · s send 1"),
+        (21, " ? e edit · s send 1 "),
+        (22, " ? · e edit · s send 1"),
+    ];
+    for (w, expected) in rows {
+        assert_eq!(footer_line(&render_at(&app, w)), expected, "the row at {w} columns");
+    }
 }
 
 #[test]
@@ -828,7 +841,7 @@ fn the_footer_shows_the_sends_outcome_at_a_pane_width_by_yielding_the_cursor_act
     let narrow = footer_line(&render_at(&app, 40));
     assert!(narrow.contains("no agent in"), "the refusal shows at 40 columns:\n{narrow}");
     assert!(narrow.contains("s send 1"), "send never drops:\n{narrow}");
-    assert!(narrow.trim_end().ends_with('?'), "the `?` never drops:\n{narrow}");
+    assert!(opens_with_more(&narrow), "the `?` never drops:\n{narrow}");
     assert!(!narrow.contains("d delete"), "the cursor's actions yield to the status:\n{narrow}");
 
     // With room for both, nothing yields.
@@ -844,11 +857,28 @@ fn the_footer_shows_the_sends_outcome_at_a_pane_width_by_yielding_the_cursor_act
     assert!(!tiny.contains("agent"), "no room for a legible message, so none is painted:\n{tiny}");
     assert!(tiny.contains("s send 1"), "send still never drops:\n{tiny}");
 
-    // A status never pushes `?` off, at any width row 1's fixed parts fit (14+).
+    // A status never pushes `?`, `send` or the primary's key off, at any width they fit (14+).
     for w in 14..=140u16 {
         let row = footer_line(&render_at(&app, w));
-        assert!(row.trim_end().ends_with('?'), "the `?` left the row at width {w}:\n{row}");
+        assert!(opens_with_more(&row), "the `?` left the row at width {w}:\n{row}");
+        assert!(row.contains("s send 1"), "send left the row at width {w}:\n{row}");
+        // An overflow clips the row's last entry: `send`, the status, or the worktree name.
+        let end = row.trim_end();
+        let whole = ["s send 1", "copy", "…", "main"].iter().any(|last| end.ends_with(last));
+        assert!(whole, "the row's last entry is clipped at width {w}:\n{row}");
+        let keyed = row.starts_with(" ? e") || row.starts_with(" ? · e");
+        assert!(w < 16 || keyed, "the primary's key left the row at width {w}:\n{row}");
     }
+
+    // A status of wide graphemes truncates by its columns, so the row still ends whole.
+    app.status = "❤️".repeat(40);
+    for w in 30..=70u16 {
+        let row = footer_line(&render_at(&app, w));
+        let end = row.trim_end();
+        let whole = ["s send 1", "…", "main"].iter().any(|last| end.ends_with(last));
+        assert!(whole, "the status overflows at width {w}:\n{row}");
+    }
+    app.status = "no agent in this workspace, press y to copy".to_string();
 
     // The comments list shows the status too, keeping room for its `…`.
     app.open_list();
@@ -870,15 +900,15 @@ fn the_expansion_aligns_row_one_into_the_labeled_grid() {
     let line_of = |lbl: &str| {
         out.lines()
             .skip(footer_start)
-            .find(|l| l.trim_start().starts_with(lbl))
+            .find(|l| l.trim_start().trim_start_matches('?').trim_start().starts_with(lbl))
             .unwrap_or("")
             .to_string()
     };
     let (do_line, go_line, move_line) = (line_of("do"), line_of("go"), line_of("move"));
 
-    // Row 1 is now the `do` band: the primary, and the `?` still at the right.
+    // Row 1 is now the `do` band: the `?` that opened it, then the primary.
     assert!(
-        do_line.contains("c comment") && do_line.trim_end().ends_with('?'),
+        do_line.contains("c comment") && opens_with_more(&do_line),
         "row 1 is the `do` line with the primary and `?`:\n{do_line}"
     );
     assert!(go_line.contains("scope"), "the go band lists the always-there keys:\n{go_line}");
@@ -903,10 +933,7 @@ fn the_collapsed_footer_stays_a_flush_action_bar() {
     let mut app = edited_app();
     on_changed_line(&mut app); // collapsed: no expansion
     let footer = footer_line(&render(&app));
-    assert!(
-        footer.trim_start().starts_with("c comment"),
-        "no `do` gutter when collapsed:\n{footer}"
-    );
+    assert!(footer.starts_with(" ? · c comment"), "no `do` gutter when collapsed:\n{footer}");
     assert!(!footer.contains(" do "), "the `do` label appears only when expanded:\n{footer}");
 }
 
@@ -925,8 +952,10 @@ fn the_expanded_row_one_never_drops_send_or_the_more_hint_on_a_narrow_pane() {
         let row1 = out.lines().find(|l| l.contains("send")).expect("row 1 carries send");
         let row1 = row1.trim_end();
         assert!(row1.contains("s send 1"), "send survives at w={w}: [{row1}]");
-        assert!(row1.ends_with('?'), "the `?` survives at w={w}: [{row1}]");
-        assert!(row1.chars().count() <= w as usize, "row 1 never overflows at w={w}: [{row1}]");
+        assert!(opens_with_more(row1), "the `?` survives at w={w}: [{row1}]");
+        // An overflow clips the row's last entry: `send`, or the worktree name after it.
+        let whole = row1.ends_with("s send 1") || row1.ends_with("main");
+        assert!(whole, "row 1 never overflows at w={w}: [{row1}]");
     }
 }
 
@@ -961,6 +990,16 @@ fn the_pr_footer_keeps_the_open_action_when_the_state_line_is_long() {
     // At narrow width the state line is capped so the primary `o open ↗` is never crowded off.
     let footer = footer_line(&render_at(&app, 60));
     assert!(footer.contains("o open"), "the open action survives a long state line:\n{footer}");
+
+    // Wide characters in the state count by their columns, so the worktree name ends the row.
+    app.pr = PrView::Pr(Box::new(PrSnapshot {
+        merge: Merge::Conflicting,
+        base_ref: "機能/ベース".into(),
+        ..common::pr_snapshot()
+    }));
+    let (folder, _) = app.worktree_name();
+    let footer = footer_line(&render_at(&app, 120));
+    assert!(footer.ends_with(&format!("  {folder} · main ")), "{footer}");
 }
 
 #[test]
@@ -1510,10 +1549,7 @@ fn all_files_tab_bar_footer_and_count_read_for_the_tab() {
         "the changed count stays in the header on All files:\n{out}"
     );
     let footer = footer_line(&out);
-    assert!(
-        footer.trim_end().ends_with('?'),
-        "the collapsed footer closes with the `?`:\n{footer}"
-    );
+    assert!(opens_with_more(&footer), "the collapsed footer opens with the `?`:\n{footer}");
     assert!(
         !footer.contains("changed"),
         "the changed count is not repeated in the footer:\n{footer}"
@@ -3411,6 +3447,136 @@ fn a_probe_row_still_fits_when_every_branch_matches() {
     assert_eq!(rows.into_iter().collect::<Vec<_>>(), [0, 1], "the hit row is inside the box");
 }
 
+#[test]
+fn the_worktree_picker_paints_its_rows_and_clicks_land_on_them() {
+    let r = Repo::init();
+    r.write("hello.rs", "alpha\n");
+    r.commit_all("init");
+    let wt = r.add_worktree("company-pages");
+    let mut app = app_on(&r);
+    app.open_worktree_picker();
+
+    let frame = render(&app);
+    assert!(frame.contains("worktrees · 2"), "{frame}");
+    assert!(frame.contains("● current"), "{frame}");
+    let tail = wt.path().file_name().unwrap().to_str().unwrap();
+    let pages = frame.lines().find(|l| l.contains("company-pages")).expect("the other row");
+    assert!(pages.contains(&format!("/{tail}│")), "the path, right-aligned: {pages}");
+
+    let rows: std::collections::BTreeSet<usize> = (0..AREA.height)
+        .flat_map(|row| (0..AREA.width).map(move |col| (col, row)))
+        .filter_map(|(col, row)| ui::hit_worktree_picker_row(AREA, &app, col, row))
+        .collect();
+    assert_eq!(rows.into_iter().collect::<Vec<_>>(), [0, 1], "both rows, the filter line skipped");
+
+    // Narrower than the shortest temp path's row (Linux), the path gives way from its head.
+    let narrow = dump(&render_size(&app, 32, 20));
+    let pages = narrow.lines().find(|l| l.contains("company-pages")).expect("the other row");
+    assert!(pages.contains('…'), "{narrow}");
+
+    // Switched away, the pane's first worktree reads `home`, under the current, over earlier branches.
+    let _alpha = r.add_worktree("alpha");
+    let mut away = App::new(wt.path().to_path_buf(), Scope::Uncommitted, None);
+    away.home = r.path().to_path_buf();
+    away.reload().unwrap();
+    away.open_worktree_picker();
+    let frame = render(&away);
+    let lines: Vec<&str> = frame.lines().collect();
+    let row = |i: usize| {
+        let at = (0..AREA.height).find(|&y| {
+            (0..AREA.width).any(|x| ui::hit_worktree_picker_row(AREA, &away, x, y) == Some(i))
+        });
+        at.map_or("", |y| lines[y as usize])
+    };
+    assert!(row(0).contains("company-pages") && row(0).contains("● current"), "{frame}");
+    assert!(row(1).contains("main") && row(1).contains(" home "), "{frame}");
+    assert!(row(2).contains("alpha") && !row(2).contains(" home "), "{frame}");
+}
+
+#[test]
+fn the_footer_names_the_worktree_at_its_right_edge() {
+    let mut app = edited_app();
+    on_changed_line(&mut app);
+    let (folder, checkout) = app.worktree_name();
+    assert_eq!(checkout, Some("main"), "the branch the load read");
+    let name = format!("{folder} · main");
+
+    // Wide, the folder and its branch close the row, one space from the edge.
+    let wide = footer_line(&render_at(&app, 120));
+    assert!(wide.ends_with(&format!("  {name} ")), "{wide}");
+    // Narrow, the name outranks the actions `?` repeats, and gives way from its head.
+    let narrow = footer_line(&render_at(&app, 30));
+    assert!(narrow.ends_with(" · main ") && narrow.contains('…'), "{narrow}");
+    assert!(!narrow.contains("v select"), "{narrow}");
+    // A status outranks it.
+    app.status = "no agent in this workspace, press y to copy".to_string();
+    let status = footer_line(&render_at(&app, 40));
+    assert!(status.contains("no agent in") && !status.contains("main"), "{status}");
+
+    // A modal footer names it after its own actions.
+    app.start_comment();
+    let composing = footer_line(&render_at(&app, 120));
+    assert!(
+        composing.contains("esc cancel") && composing.ends_with(&format!("  {name} ")),
+        "{composing}"
+    );
+
+    // Wide characters in an action count by their columns, so the name still ends the row.
+    let r = Repo::init();
+    r.write("hello.rs", "alpha\n");
+    r.commit_all("init");
+    let _wide = r.add_worktree("機能/ブランチ名");
+    let mut app = app_on(&r);
+    let (folder, _) = app.worktree_name();
+    app.store.add(herdr_reviewr::model::Comment {
+        file: "hello.rs".into(),
+        side: herdr_reviewr::model::Side::New,
+        start: 1,
+        end: 1,
+        lines: "+alpha".into(),
+        text: "unsent".into(),
+        diff_anchored: true,
+        rev: herdr_reviewr::model::Rev::Worktree,
+        quote: None,
+    });
+    app.open_worktree_picker();
+    for code in [KeyCode::Down, KeyCode::Enter] {
+        handle_key(&mut app, KeyEvent::from(code), AREA, &Keymap::default()).unwrap();
+    }
+    assert!(app.switch_question().is_some());
+    let asking = footer_line(&render_at(&app, 120));
+    assert!(asking.contains("(1 pending) · esc cancel"), "{asking}");
+    assert!(asking.ends_with(&format!("  {folder} · main ")), "{asking}");
+
+    // The question owns its row on `PR` too, the PR's state line set aside as quit's is.
+    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), AREA, &Keymap::default()).unwrap();
+    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), AREA, &Keymap::default()).unwrap();
+    app.set_tab(Tab::Pr).unwrap();
+    app.pr = herdr_reviewr::forge::PrView::Pr(Box::new(common::pr_snapshot()));
+    app.open_worktree_picker();
+    for code in [KeyCode::Down, KeyCode::Enter] {
+        handle_key(&mut app, KeyEvent::from(code), AREA, &Keymap::default()).unwrap();
+    }
+    assert!(app.switch_question().is_some());
+    let on_pr = footer_line(&render_at(&app, 60));
+    assert!(on_pr.starts_with(" W switch"), "{on_pr}");
+
+    // A branch with a `/` reads whole: the folder gives way before it.
+    let r = Repo::init();
+    r.write("hello.rs", "alpha\n");
+    r.commit_all("init");
+    let keep = tempfile::tempdir().unwrap();
+    let wt = keep.path().join("herdr-reviewr");
+    r.git(&["worktree", "add", "-q", "-b", "worktree/lucky-meadow-02ec", wt.to_str().unwrap()]);
+    let mut app = App::new(wt, Scope::Uncommitted, None);
+    app.reload().unwrap();
+    let row = footer_line(&render_at(&app, 55));
+    assert_eq!(row, " ? · b/t/g scope  …eviewr · worktree/lucky-meadow-02ec ");
+    // With no column left for the folder's `…`, the branch stands alone.
+    let row = footer_line(&render_at(&app, 45));
+    assert_eq!(row, " ? · b/t/g scope  worktree/lucky-meadow-02ec ");
+}
+
 fn now_minus(secs: u64) -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3994,7 +4160,10 @@ fn the_commit_picker_paints_rows_a_run_bar_and_its_count() {
     let ends: std::collections::HashSet<usize> =
         rows.iter().map(|l| l[..l.find("  Test ").unwrap()].chars().count()).collect();
     assert_eq!(ends.len(), 1, "the author column is one edge:\n{out}");
-    assert!(!out.contains("· main"), "the checked-out branch is never a ref:\n{out}");
+    assert!(
+        !rows.iter().any(|l| l.contains("· main")),
+        "the checked-out branch is never a ref:\n{out}"
+    );
     let rows: Vec<&str> = out.lines().filter(|l| l.contains("▎")).collect();
     assert_eq!(rows.len(), 3, "the run carries a bar:\n{out}");
     assert!(
@@ -4119,7 +4288,7 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
         "both panes:\n{out}"
     );
     let footer = footer_line(&out);
-    assert!(footer.trim_start().starts_with("G commits"), "{footer}");
+    assert!(footer.starts_with(" ? · G commits"), "{footer}");
     assert!(footer.contains("u/b/t scope"), "the other three scopes: {footer}");
 }
 
@@ -4165,10 +4334,10 @@ fn a_wide_glyph_author_keeps_the_age_column() {
         .lines()
         .skip(1)
         .filter(|l| l.contains("  ") && (l.contains("Test") || l.contains("田")))
-        // The test backend dumps one char per cell, so a char index is a column.
+        // One char per cell. A padded `0s` and a `30s` share the age's last column.
         .map(|l| {
             let cells: Vec<char> = l.trim_end_matches([' ', '│']).chars().collect();
-            cells.iter().rposition(|c| *c == ' ').unwrap()
+            cells.iter().rposition(char::is_ascii_alphabetic).unwrap()
         })
         .collect();
     assert!(out.contains("田"), "{out}");
@@ -4658,7 +4827,7 @@ fn the_quit_question_owns_the_footer_and_the_blocked_screen() {
         "the footer is the question:\n{row}"
     );
     assert!(row.contains("s send 1") && row.contains("y copy"), "{row}");
-    assert!(!row.trim_end().ends_with('?'), "the question owns the bar:\n{row}");
+    assert!(!opens_with_more(&row), "the question owns the bar:\n{row}");
 
     // A pane-width row keeps the way out, even with a status left over from the comment.
     app.status = "comment added".to_string();
@@ -4726,12 +4895,14 @@ fn a_trimmed_modal_row_always_shows_its_ellipsis() {
         for w in 30..=80u16 {
             let row = footer_line(&render_at(&app, w));
             let row = row.trim_end();
-            assert!(row.chars().count() <= usize::from(w), "{n} at {w} overflows:\n{row}");
             if !row.contains("y copy") {
                 assert!(row.ends_with('…'), "{n} at {w} trims without its `…`:\n{row}");
             }
+            // An overflow clips the row's last entry: `y copy`, or the worktree name after it.
+            let whole = ["…", "y copy", "main"].iter().any(|last| row.ends_with(last));
+            assert!(whole, "{n} at {w} overflows:\n{row}");
         }
-        app.confirming_quit = false;
+        app.question = None;
     }
 }
 

@@ -14,6 +14,41 @@ use tempfile::TempDir;
 #[allow(unused_imports)]
 pub use fixture::fixture;
 
+/// An export target that records what it was handed and can be made to fail.
+pub struct FakeTarget {
+    ok: bool,
+    captured: std::cell::RefCell<Vec<String>>,
+}
+
+impl FakeTarget {
+    pub fn ok() -> Self {
+        Self { ok: true, captured: std::cell::RefCell::default() }
+    }
+    pub fn failing() -> Self {
+        Self { ok: false, captured: std::cell::RefCell::default() }
+    }
+    pub fn last(&self) -> String {
+        self.captured.borrow().last().cloned().unwrap_or_default()
+    }
+}
+
+impl herdr_reviewr::export::ExportTarget for FakeTarget {
+    fn label(&self) -> &'static str {
+        "fake"
+    }
+    fn success_message(&self, count: usize) -> String {
+        let noun = if count == 1 { "comment" } else { "comments" };
+        format!("exported {count} {noun}")
+    }
+    fn failure_message(&self, _error: &anyhow::Error, _copy: &str) -> String {
+        "fake not found".to_string()
+    }
+    fn export(&self, text: &str) -> anyhow::Result<()> {
+        self.captured.borrow_mut().push(text.to_string());
+        if self.ok { Ok(()) } else { anyhow::bail!("fake export failure") }
+    }
+}
+
 /// The fake herdr, built here once per test process: `cargo test --test` builds no examples.
 pub fn fake_herdr() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();

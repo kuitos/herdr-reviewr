@@ -23,7 +23,7 @@ A code-review pane for [herdr](https://herdr.dev). Read your agent's diff beside
 comment on lines, and send the comments back.
 
 This is the [kuitos fork](https://github.com/kuitos/herdr-reviewr) of
-[persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) v0.48.0. Install it from
+[persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) v0.49.0. Install it from
 this fork: `herdr plugin install kuitos/herdr-reviewr`.
 
 ![demo](assets/demo.gif)
@@ -35,6 +35,7 @@ this fork: `herdr plugin install kuitos/herdr-reviewr`.
 - **Line comments** — on a line, a range, or the exact text you selected, sent to the agent.
 - **Text selection** — drag to copy, like an editor. Press `c` to comment on that text.
 - **File viewer** — any file in the worktree, including a directory that is not a git repository.
+- **Worktree switch** — follow your agent into another worktree with `W`.
 - **Search** — files by name and code by content, powered by [fff](https://github.com/dmtrKovalenko/fff).
 - **Find in file** — step through every match.
 - **PR view** — the branch's pull request, read-only.
@@ -85,7 +86,7 @@ herdr-reviewr ~/some/repo
 4. **Comment.** `c`, type, `Enter`.
 5. **Send.** `s` puts every comment in the agent's input.
 
-The footer shows the next step. `?` lists every key.
+The footer shows the next step, and the worktree you're on at its right. `?` lists every key.
 
 To toggle reviewr with a key, add this to `~/.config/herdr/config.toml`:
 
@@ -108,6 +109,7 @@ Every key can be rebound ([Keybindings](#keybindings)).
 | `u` `b` `t` `g` | Scope: uncommitted / branch / last turn / commits |
 | `B` | Pick the base branch |
 | `G` | Pick commits |
+| `W` | Switch to another worktree of this repo |
 | `j` `k` · `↑` `↓` | Move |
 | `]` `[` | Next / previous change |
 | `f` `F` | Next / previous file |
@@ -288,6 +290,7 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `next-file` / `prev-file` | `f` / `F` |
 | `scope-uncommitted` / `scope-branch` / `scope-last-turn` / `scope-commits` | `u` / `b` / `t` / `g` |
 | `base-pick` / `commit-pick` | `B` / `G` |
+| `worktree-pick` | `W` |
 | `tab-changes` / `tab-all-files` / `tab-pr` | `1` / `2` / `3` |
 | `wrap` | `w` |
 | `rendered` | `m` |
