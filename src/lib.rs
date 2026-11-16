@@ -2776,18 +2776,27 @@ mod refresh_tests {
     };
     use crate::app::{App, Question, Tab};
 
-    /// `path` spelled relative to the process cwd, so a startup test can pass a non-absolute repo.
-    fn path_relative_to_cwd(path: &std::path::Path) -> std::path::PathBuf {
-        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        let path = std::fs::canonicalize(path).unwrap();
+    /// A plain directory beside the checkout, spelled relative to the cwd. Beside, so it stays
+    /// outside the worktree and on the cwd's drive: a system temp on another drive has no relative form.
+    fn plain_beside_the_checkout() -> (tempfile::TempDir, std::path::PathBuf) {
+        let cwd = std::env::current_dir().unwrap();
+        let anchor = crate::git::toplevel(&cwd).unwrap_or_else(|| cwd.clone());
+        let parent = anchor.parent().expect("the checkout has a parent directory");
+        let plain = tempfile::tempdir_in(parent).unwrap();
+        let relative = relative_to(&cwd, plain.path());
+        (plain, relative)
+    }
+
+    /// `target` relative to `base`. Both sit under one root.
+    fn relative_to(base: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
         let mut ups = std::path::PathBuf::new();
-        let mut base = cwd.as_path();
+        let mut cursor = base;
         loop {
-            if let Ok(rest) = path.strip_prefix(base) {
+            if let Ok(rest) = target.strip_prefix(cursor) {
                 return if rest.as_os_str().is_empty() { ups } else { ups.join(rest) };
             }
             ups.push("..");
-            base = base.parent().expect("the directory and the cwd share a root");
+            cursor = cursor.parent().expect("the directory and the cwd share a root");
         }
     }
 
@@ -3661,8 +3670,7 @@ mod refresh_tests {
     fn a_relative_plain_path_stays_absolute_and_opens_on_all_files() {
         use crate::config::{Config, plugin_config_in};
         use crate::world::RepoKind;
-        let plain = tempfile::tempdir().unwrap();
-        let relative = path_relative_to_cwd(plain.path());
+        let (plain, relative) = plain_beside_the_checkout();
         assert!(relative.is_relative(), "{}", relative.display());
         let cfg = Config::parse([relative.display().to_string()]);
         let config_dir = tempfile::tempdir().unwrap();
