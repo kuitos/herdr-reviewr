@@ -4481,6 +4481,11 @@ fn m_marker_fg(buf: &Buffer) -> ratatui::style::Color {
     buf.cell((x, y)).unwrap().style().fg.expect("the marker is colored")
 }
 
+/// A pane whose tab switch carries no file, so `All files` opens on its folders closed.
+fn app_on_closed_tree(r: &Repo) -> App {
+    common::app_on_config(r, "follow_file_across_tabs = false\n")
+}
+
 /// `src/` and `docs/` committed, `src/ui.rs` and `zz.rs` edited, `zz.rs` for the color.
 fn dotted_repo() -> Repo {
     let r = Repo::init();
@@ -4498,7 +4503,7 @@ fn dotted_repo() -> Repo {
 #[test]
 fn a_collapsed_all_files_folder_with_a_change_wears_a_dot() {
     let r = dotted_repo();
-    let mut app = app_on(&r);
+    let mut app = app_on_closed_tree(&r);
     enter_tab(&mut app, Tab::AllFiles);
     assert!(dot_at_edge(&app, "src/"), "src/ holds the edit: {:?}", files_row(&app, "src/"));
     assert!(!files_row(&app, "docs/").contains('•'), "docs/ holds no change");
@@ -4523,7 +4528,7 @@ fn a_kept_change_under_an_ignored_folder_wears_the_same_dot() {
     r.commit_all("vendor");
     r.write("vendor/lib.rs", "v2\n");
     r.write("zz.rs", "z3\n");
-    let mut app = app_on(&r);
+    let mut app = app_on_closed_tree(&r);
     enter_tab(&mut app, Tab::AllFiles);
     assert!(dot_at_edge(&app, "vendor/"), "{:?}", files_row(&app, "vendor/"));
 }
@@ -4547,21 +4552,26 @@ fn a_folder_whose_only_change_has_no_row_wears_no_dot() {
 }
 
 #[test]
-fn a_collapsed_changes_folder_wears_no_dot_and_reserves_nothing() {
-    // `Changes` paints no dot.
+fn a_collapsed_changes_folder_wears_its_line_sums_instead_of_the_dot() {
     let r = dotted_repo();
     r.write("src/app.rs", "x2\n"); // two changed files keep `src/` a directory row
     let mut app = app_on(&r);
+    assert_eq!(files_row(&app, "src/"), "▾ src/", "an open folder's files show their own");
     app.focus = Focus::Files;
     app.file_cursor = app.file_rows.iter().position(|r| r.dir_path() == Some("src")).unwrap();
     app.collapse_dir();
-    assert!(!files_row(&app, "src/").contains('•'), "no dot on Changes");
+    let row = files_row(&app, "src/");
+    assert!(!row.contains('•') && row.ends_with("+2 −2"), "collapsed, it sums: {row:?}");
     let wide = "n".repeat((FILES_X1 - FILES_X0) as usize - 2); // `▸ ` + name + `/` fills the row
     r.write(&format!("{wide}/a.rs"), "a\n");
     r.write(&format!("{wide}/b.rs"), "b\n");
     app.reload().unwrap();
     let row = files_row(&app, &wide[..20]);
-    assert_eq!(row, format!("▾ {wide}/"), "the exact-fit name is whole on Changes");
+    assert_eq!(row, format!("▾ {wide}/"), "an open folder keeps its whole name on Changes");
+    app.file_cursor = app.file_rows.iter().position(|r| r.dir_path() == Some(&wide)).unwrap();
+    app.collapse_dir();
+    let row = files_row(&app, &wide[..20]);
+    assert_eq!(row, format!("▸ …{}/  +2", &wide[5..]), "collapsed, the sums elide the name");
     enter_tab(&mut app, Tab::AllFiles);
     assert!(dot_at_edge(&app, "…"), "{:?}", files_row(&app, "…"));
     assert_eq!(
@@ -4606,7 +4616,7 @@ fn a_long_folder_name_leaves_room_for_the_dot() {
     r.commit_all("init");
     r.write(&format!("{dir}/one.rs"), "1b\n");
     r.write("zz.rs", "z2\n");
-    let mut app = app_on(&r);
+    let mut app = app_on_closed_tree(&r);
     enter_tab(&mut app, Tab::AllFiles);
     assert!(dot_at_edge(&app, "…"), "{:?}", files_row(&app, "…"));
     let row = files_row(&app, "…");

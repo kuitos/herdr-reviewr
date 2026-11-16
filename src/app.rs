@@ -54,6 +54,27 @@ enum DividerDrag {
     Cancelled,
 }
 
+/// The first world build's outcome, which an empty list reports instead of "no changes".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorldLoad {
+    /// Still building; the refresh glyph lights past its delay.
+    Pending,
+    Landed,
+    /// The build failed before any landed.
+    Failed,
+}
+
+/// How a frame shows the read cursor, weakest first: one event's strongest request wins.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Reveal {
+    /// Just onto the screen: a click, a drag, a relayout, a clamp.
+    Edge,
+    /// A keyboard step: onto the screen with `scrolloff` lines around it.
+    Context,
+    /// A jump: centered when it lands off screen.
+    Center,
+}
+
 /// Which pane has the keyboard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
@@ -601,6 +622,8 @@ pub enum FooterAction {
     Split,
     Scope,
     Send,
+    /// `send-to`: pick the agent, shown in the `?` bands beside `send`.
+    SendTo,
     List,
     Copy,
     /// The quit question's answer that quits, naming the comments still pending.
@@ -716,10 +739,8 @@ pub struct App {
     pub file_scroll: usize,
     /// Set by navigation, never the wheel, to reveal `file_cursor` next frame.
     pub reveal_files: bool,
-    /// Set by navigation, never the wheel, to reveal `diff_cursor` next frame.
-    pub reveal_diff: bool,
-    /// Set by `goto_line`: center a cursor that landed off screen, not nudge it to the edge.
-    pub reveal_center: bool,
+    /// How the next frame shows `diff_cursor`; navigation sets it, never the wheel.
+    pub diff_reveal: Option<Reveal>,
     /// Set by a relayout: the screen lines above the cursor the next frame keeps.
     keep_above: Option<usize>,
     /// The file crossing a hunk step armed at the file's last hunk.
@@ -854,6 +875,8 @@ pub struct App {
     pub pr_pending: Option<RefreshKind>,
     /// The world refresh to dispatch after the frame paints.
     pub world_request: Option<crate::world::WorldRequest>,
+    /// Whether the first world build landed: until it does, no list claims "no changes".
+    pub world_load: WorldLoad,
     /// The search overlay's state while `mode == Mode::Search`, `None` otherwise.
     pub search: Option<SearchOverlay>,
     /// A query to dispatch after the frame paints.
@@ -970,8 +993,7 @@ impl App {
             file_cursor: 0,
             file_scroll: 0,
             reveal_files: false,
-            reveal_diff: false,
-            reveal_center: false,
+            diff_reveal: None,
             keep_above: None,
             armed_cross: None,
             resume_list: false,
@@ -1043,6 +1065,7 @@ impl App {
             reveal_pr_nav: std::cell::Cell::new(true),
             pr_pending: None,
             world_request: None,
+            world_load: WorldLoad::Pending,
             search: None,
             search_dirty: false,
             search_track: None,
@@ -1198,7 +1221,7 @@ impl App {
                 self.file_cursor = old.file_cursor;
                 self.file_scroll = old.file_scroll;
                 self.reveal_files = old.reveal_files;
-                self.reveal_diff = old.reveal_diff;
+                self.diff_reveal = old.diff_reveal;
                 self.changeset = std::mem::take(&mut old.changeset);
                 // The header and the footer's branch describe the carried list, so they carry too.
                 self.branch_base = std::mem::take(&mut old.branch_base);
@@ -1332,8 +1355,9 @@ impl App {
     /// Build and reconcile synchronously; never touches comments or the draft.
     pub fn reload(&mut self) -> Result<()> {
         self.ensure_config_ready()?;
-        // A plain directory lists through the build; `PR` reads only the checkout.
-        let snapshot = crate::world::build(&self.world_input())?;
+        // A plain directory lists through the build; a failed one says so instead of staying blank.
+        let snapshot =
+            crate::world::build(&self.world_input()).inspect_err(|_| self.load_failed())?;
         self.reconcile_world(snapshot);
         Ok(())
     }
@@ -1373,6 +1397,7 @@ impl App {
 
     /// Reconcile a snapshot into the view (Continuity); whether the file view took it, as `PR` never does.
     pub fn reconcile_world(&mut self, snapshot: crate::world::WorldSnapshot) -> bool {
+        self.world_load = WorldLoad::Landed;
         // A path-limited build carries its checkout rather than reading it.
         if snapshot.touched.is_none() {
             self.read_checkout.clone_from(&snapshot.checkout);
@@ -1553,7 +1578,7 @@ impl App {
         let last = self.visible.len() - 1;
         let clamped = self.diff_cursor.min(last);
         if clamped != self.diff_cursor {
-            self.reveal_diff = true;
+            self.reveal_diff(Reveal::Edge);
         }
         self.diff_cursor = clamped;
         self.diff_scroll = self.diff_scroll.min(last);
@@ -1777,6 +1802,7 @@ impl App {
         let set: HashSet<String> = open.iter().cloned().collect();
         let doc = crate::markdown::render_expanded(
             old,
+            crate::markdown::Origin::File,
             DEFAULT_RENDER_WIDTH,
             &self.highlighter,
             &self.palette,
@@ -2270,7 +2296,7 @@ impl App {
         // The old rows' marks go with them; a navigator highlight was never on them.
         self.drop_read_marks();
         self.settle_read();
-        self.reveal_diff = true;
+        self.reveal_diff(Reveal::Edge);
     }
 
     /// The styled lines the rendered rows paint, indexed by a `Row::Rendered`'s `line`.
@@ -2421,6 +2447,7 @@ impl App {
     ) -> crate::markdown::Rendered {
         self.markdown_cache.borrow_mut().get_expanded(
             text,
+            crate::markdown::Origin::File,
             width,
             &self.highlighter,
             &self.palette,
@@ -2443,6 +2470,7 @@ impl App {
             .collect();
         let mut rendered = self.markdown_cache.borrow_mut().get_expanded(
             text,
+            crate::markdown::Origin::Body,
             width,
             &self.highlighter,
             &self.palette,
@@ -2691,15 +2719,21 @@ impl App {
         self.file_scroll = bound(self.file_scroll, self.file_rows.len(), viewport);
     }
 
-    /// Nudge the diff to show the cursor, or while composing the line the box opens under.
-    pub fn reveal_diff_cursor(&mut self, heights: &[usize], viewport: usize) {
+    /// Nudge the cursor (composing, the box's line) on screen, `margin` lines clear of the edges.
+    pub fn reveal_diff_cursor(&mut self, heights: &[usize], viewport: usize, margin: usize) {
         if self.visible.is_empty() {
             self.diff_scroll = 0;
             return;
         }
         let target = if self.composing() { self.compose_row() } else { self.diff_cursor };
         let target = target.min(self.visible.len() - 1);
-        self.diff_scroll = keep_in_view(target, self.diff_scroll, heights, viewport);
+        self.diff_scroll = keep_in_view_off(target, self.diff_scroll, heights, viewport, margin);
+    }
+
+    /// The lines a keyboard move keeps around the diff cursor (`scrolloff`).
+    fn scrolloff(&self) -> usize {
+        self.plugin_config()
+            .map_or(crate::config::DEFAULT_SCROLLOFF, crate::config::PluginConfig::scrolloff)
     }
 
     /// Center the cursor's row by display heights when it sits off screen.
@@ -2718,19 +2752,37 @@ impl App {
         self.diff_scroll = top_leaving(heights, target, room);
     }
 
-    /// Settle the scroll: a line jump centers (eating a same-event nudge), else nudge, then bound.
+    /// Settle the scroll by the event's reveal request, then bound it.
     pub fn settle_diff_scroll(&mut self, heights: &[usize], viewport: usize) {
-        let nudge = std::mem::take(&mut self.reveal_diff);
+        let reveal = self.diff_reveal.take();
         if let Some(lines) = self.keep_above.take() {
             let target = self.diff_cursor.min(heights.len().saturating_sub(1));
             self.diff_scroll = top_leaving(heights, target, lines);
         }
-        if std::mem::take(&mut self.reveal_center) {
-            self.center_diff_cursor(heights, viewport);
-        } else if nudge || self.composing() {
-            self.reveal_diff_cursor(heights, viewport);
+        // Only the keyboard keeps the margin: a click, a drag or a relayout leaves rows in place.
+        match reveal {
+            Some(Reveal::Center) => {
+                self.center_diff_cursor(heights, viewport);
+                self.reveal_diff_cursor(heights, viewport, self.scrolloff());
+            }
+            Some(Reveal::Context) => self.reveal_diff_cursor(heights, viewport, self.scrolloff()),
+            Some(Reveal::Edge) => self.reveal_diff_cursor(heights, viewport, 0),
+            None if self.composing() => self.reveal_diff_cursor(heights, viewport, 0),
+            None => {}
         }
         self.bound_diff_scroll(heights, viewport);
+    }
+
+    /// A world build failed: before any landed, the lists say so instead of staying blank.
+    pub fn load_failed(&mut self) {
+        if self.world_load == WorldLoad::Pending {
+            self.world_load = WorldLoad::Failed;
+        }
+    }
+
+    /// Ask the next frame to show the read cursor; the strongest request in one event wins.
+    pub fn reveal_diff(&mut self, how: Reveal) {
+        self.diff_reveal = self.diff_reveal.max(Some(how));
     }
 
     /// Clamp `diff_scroll` by display heights, so tall wrapped rows stay reachable.
@@ -2832,8 +2884,13 @@ impl App {
         self.pr_pending = self.pr_pending.max(Some(kind));
     }
 
-    /// Switch to `tab`, restoring its place as left; a refresh lands behind (Continuity).
+    /// Switch to `tab`: the file left follows when the config asks and the tab lists it.
     pub fn set_tab(&mut self, tab: Tab) -> Result<()> {
+        self.switch_tab(tab, true)
+    }
+
+    /// Switch to `tab`: its place as left, or the file and line left if `follow` and the config agree.
+    fn switch_tab(&mut self, tab: Tab, follow: bool) -> Result<()> {
         self.ensure_config_ready()?;
         if self.tab == tab || self.composing() {
             return Ok(());
@@ -2841,6 +2898,7 @@ impl App {
         if tab == Tab::Pr && self.refuse_outside_git() {
             return Ok(());
         }
+        let follow = follow && self.config_snapshot().follow_file_across_tabs();
         // The line field was typed for the tab it opened over; the PR tab draws no band at all.
         if self.line_open() || (tab == Tab::Pr && self.mode == Mode::Find) {
             self.close_find();
@@ -2854,7 +2912,11 @@ impl App {
             return Ok(());
         }
         // Bring the tab's state into the live fields if the stash holds it.
+        let mut carried = None;
         if self.active_file_tab != tab {
+            if follow {
+                carried = self.carried_to(tab);
+            }
             self.swap_active_with_stash();
             self.active_file_tab = tab;
             // Follow a markdown choice flipped while away.
@@ -2864,11 +2926,24 @@ impl App {
                 self.relayout();
             }
         }
+        if let Some((path, _)) = &carried {
+            self.point_at(path);
+        }
         // A return paints its stash and refreshes behind; a first visit loads before the frame.
         if self.tab_visited {
             self.request_world_refresh(true);
+            // The stash may hold an older copy of the carried file.
+            if carried.is_some() {
+                self.reload_open_view();
+            }
         } else {
             self.reload()?;
+        }
+        // A file gone before the load landed leaves the line unlanded.
+        if let Some((path, Some(n))) = carried
+            && self.diff_path.as_deref() == Some(path.as_str())
+        {
+            self.land_worktree_line(n);
         }
         self.settle_tab_entry();
         // A find band opened over the other tab's file does not search this one's.
@@ -2877,6 +2952,51 @@ impl App {
         }
         self.reveal_files = true; // pull the restored cursor back into view
         Ok(())
+    }
+
+    /// The open file and its worktree line, when file tab `tab` lists that file.
+    fn carried_to(&self, tab: Tab) -> Option<(String, Option<u32>)> {
+        let path = self.diff_path.clone()?;
+        // `All files` lists every file on disk; `Changes`, the scope's changeset.
+        let listed = match tab {
+            Tab::AllFiles => self.repo.join(&path).is_file(),
+            Tab::Changes => self.changeset.files.contains_key(&path),
+            Tab::Pr => false,
+        };
+        listed.then(|| (path, self.worktree_line()))
+    }
+
+    /// Put the tree cursor on `path`, its folders open, listing it if this tab's list predates it.
+    fn point_at(&mut self, path: &str) {
+        let mut changed = false;
+        let mut dir = path;
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            changed |= self.set_dir_expanded(parent, true);
+            dir = parent;
+        }
+        // The refresh behind lands the true list; this row stands in until it does.
+        if !self.entries.iter().any(|e| e.path == path) {
+            let annotation = self.changeset.files.get(path).cloned();
+            let at = self.entries.partition_point(|e| e.path.as_str() < path);
+            let entry = Entry { path: path.to_string(), annotation, ignored: false, is_dir: false };
+            self.entries.insert(at, entry);
+            changed = true;
+        }
+        if changed {
+            self.rebuild_file_rows();
+        }
+        if let Some(row) = self.file_row_of_path(path) {
+            self.file_cursor = row;
+        }
+        self.reveal_files = true;
+    }
+
+    /// Land on worktree line `n`; a cursor already on it keeps its place and selection.
+    fn land_worktree_line(&mut self, n: u32) {
+        if self.worktree_numbered() && self.worktree_line() != Some(n) {
+            self.clear_selection();
+            self.land_line(n);
+        }
     }
 
     /// Focus the tree when the read pane is empty, so the keys aren't trapped.
@@ -3130,7 +3250,7 @@ impl App {
                         target = self.fold_clamped(a, target);
                     }
                     self.diff_cursor = target;
-                    self.reveal_diff = true;
+                    self.reveal_diff(Reveal::Context);
                 }
             }
         }
@@ -3188,7 +3308,7 @@ impl App {
         }
         if let Some(row) = hunk_row(&self.visible, Some(self.diff_cursor), forward) {
             self.diff_cursor = row;
-            self.reveal_diff = true;
+            self.reveal_diff(Reveal::Center);
             return;
         }
         let Some(armed) = armed else {
@@ -3210,7 +3330,7 @@ impl App {
         // Land on a hunk of the rows now on screen.
         self.diff_cursor = hunk_row(&self.visible, None, forward).unwrap_or(0);
         self.reveal_files = true;
-        self.reveal_diff = true;
+        self.reveal_diff(Reveal::Center);
     }
 
     /// The nearest file row that way with a hunk, so a crossing always lands on a change.
@@ -3418,7 +3538,7 @@ impl App {
             self.focus = Focus::Diff;
             let anchor = *self.select_anchor.get_or_insert(self.diff_cursor);
             self.diff_cursor = self.fold_clamped(anchor, index);
-            self.reveal_diff = true;
+            self.reveal_diff(Reveal::Edge);
         }
     }
 
@@ -3564,7 +3684,7 @@ impl App {
         self.diff_cursor = row;
         self.select_anchor = None;
         self.gesture = crate::selection::Gesture::Gutter;
-        self.reveal_diff = true;
+        self.reveal_diff(Reveal::Edge);
     }
 
     /// Finish a gutter gesture by opening the composer.
@@ -3599,7 +3719,7 @@ impl App {
                 Some(_) => None,
                 None => Some(self.diff_cursor),
             };
-            self.reveal_diff = true;
+            self.reveal_diff(Reveal::Edge);
         }
     }
 
@@ -3607,7 +3727,7 @@ impl App {
     pub fn clear_selection(&mut self) {
         if self.select_anchor.is_some() {
             self.select_anchor = None;
-            self.reveal_diff = true;
+            self.reveal_diff(Reveal::Edge);
         }
     }
 
@@ -3621,7 +3741,7 @@ impl App {
 
     pub fn start_comment(&mut self) {
         if self.focus == Focus::Diff && self.has_anchorable_selection() {
-            self.reveal_diff = true; // scroll the anchored line into view before the box opens
+            self.reveal_diff(Reveal::Edge); // scroll the anchored line into view before the box opens
             self.input.clear();
             self.caret = 0;
             self.resume_list = false; // a fresh diff comment returns to the diff, not the list
@@ -3735,36 +3855,41 @@ impl App {
         if self.mode != Mode::Normal {
             return None;
         }
-        let (path, numbered) = if self.focus == Focus::Files {
+        let (path, line) = if self.focus == Focus::Files {
             // The selected navigator file at its start. A directory row names no file.
-            (self.current_entry()?.path.clone(), false)
+            (self.current_entry()?.path.clone(), 1)
         } else {
             // A press must not abandon a live selection.
             if self.select_anchor.is_some() {
                 return None;
             }
-            // The open file; in `commits` the line numbers aren't the worktree's, so no line.
-            let commit_diff = self.scope == Scope::Commits && self.diff.view == View::Diff;
-            (self.diff_path.clone()?, !commit_diff)
+            (self.diff_path.clone()?, self.worktree_line().unwrap_or(1))
         };
-        let line = if !numbered {
-            1
-        } else if self.rendered_active() {
-            // A block's first line, or a marker's line clamped to the file's end.
+        Some(EditTarget { path, line })
+    }
+
+    /// Whether the read pane numbers worktree lines: a `commits` diff numbers the commits'.
+    fn worktree_numbered(&self) -> bool {
+        !(self.scope == Scope::Commits && self.diff.view == View::Diff)
+    }
+
+    /// The worktree line under the read cursor, else the start; `None` in a `commits` diff.
+    fn worktree_line(&self) -> Option<u32> {
+        if !self.worktree_numbered() {
+            return None;
+        }
+        // Rendered rows: a block's first line, or a marker's line clamped to the file's end.
+        if self.rendered.on_screen() {
             let last = self.rendered.text().unwrap_or_default().lines().count().max(1) as u32;
-            match self.rendered.index.unit_at(self.diff_cursor).map(|u| u.unit) {
+            return Some(match self.rendered.index.unit_at(self.diff_cursor).map(|u| u.unit) {
                 Some(Unit::Block(src)) => src,
                 Some(Unit::Marker(src, _)) => src.clamp(1, last),
                 None => 1,
-            }
-        } else {
-            // The nearest worktree line number at or above the cursor, else the start.
-            self.visible
-                .get(..=self.diff_cursor)
-                .and_then(|above| above.iter().rev().find_map(Visible::new_no))
-                .unwrap_or(1)
-        };
-        Some(EditTarget { path, line })
+            });
+        }
+        // Source rows: the nearest worktree line number at or above the cursor.
+        let above = self.visible.get(..=self.diff_cursor);
+        Some(above.and_then(|rows| rows.iter().rev().find_map(Visible::new_no)).unwrap_or(1))
     }
 
     fn edit_comment(&mut self) {
@@ -3794,7 +3919,7 @@ impl App {
             self.select_anchor = None;
         }
         self.focus = Focus::Diff;
-        self.reveal_diff = true; // scroll the edited line into view before the box opens
+        self.reveal_diff(Reveal::Edge); // scroll the edited line into view before the box opens
         self.caret = text.chars().count(); // edit opens with the caret at the end
         self.input = text;
         self.resume_list = from_list;
@@ -3987,6 +4112,14 @@ impl App {
             let start = word_start(v, *caret);
             v.drain(start..*caret);
             *caret = start;
+        });
+    }
+
+    /// `Alt+Delete`: delete whitespace, then the word, after the caret.
+    pub fn input_delete_word_forward(&mut self) {
+        self.edit_input(|v, caret| {
+            let end = word_end(v, *caret);
+            v.drain(*caret..end);
         });
     }
 
@@ -4426,7 +4559,7 @@ impl App {
         self.focus = Focus::Diff;
         self.select_anchor = None; // a comment jump is navigation, not a selection extend
         self.diff_cursor = row;
-        self.reveal_diff = true;
+        self.reveal_diff(Reveal::Center);
         self.target_comment_card(ci);
     }
 
@@ -4472,7 +4605,7 @@ impl App {
         self.mode = Mode::Find;
         self.find = Some(Find::default());
         // The band takes the bottom row; keep the cursor above it.
-        self.reveal_diff = true;
+        self.reveal_diff(Reveal::Edge);
     }
 
     /// `:`: open the line field in the band's place, wherever find opens, over the open file.
@@ -4571,17 +4704,25 @@ impl App {
         if !self.find_available() {
             return;
         }
-        let last = u32::try_from(self.line_count()).unwrap_or(u32::MAX).max(1);
-        let n = n.clamp(1, last);
         self.clear_selection();
         self.focus = Focus::Diff;
+        self.land_line(n);
+    }
+
+    /// Land the cursor on line `n`, clamped to the file, opening what hides it, centered off screen.
+    fn land_line(&mut self, n: u32) {
+        if !self.find_available() {
+            return;
+        }
+        let last = u32::try_from(self.line_count()).unwrap_or(u32::MAX).max(1);
+        let n = n.clamp(1, last);
         if self.rendered_active() {
             self.open_disclosures_holding(n);
             self.diff_cursor = self.rendered.index.row_at_line(n).unwrap_or(0);
         } else {
             self.diff_cursor = self.land_on_line(n, self.line_side());
         }
-        self.reveal_center = true;
+        self.reveal_diff(Reveal::Center);
     }
 
     /// The row holding line `n` by `side`, its fold opened first: find steps and `:N` share it.
@@ -4673,7 +4814,7 @@ impl App {
             FindHit::Visible(v) => self.diff_cursor = v,
             FindHit::Folded { new_no } => self.diff_cursor = self.land_on_line(new_no, Side::New),
         }
-        self.reveal_diff = true;
+        self.reveal_diff(Reveal::Center);
     }
 
     /// Find's query; `None` for the line field, whose digits are no search.
@@ -4810,40 +4951,19 @@ impl App {
             return Ok(());
         }
         self.close_search();
-        // The origin tab stashes its place.
+        // The origin tab stashes its place; the pick, not the file left, opens.
         if self.tab != Tab::AllFiles {
-            self.set_tab(Tab::AllFiles)?;
+            self.switch_tab(Tab::AllFiles, false)?;
         }
         // The pick feeds the engine's frecency store, so ranking improves with use.
         self.search_track = Some(path.clone());
-        let mut expanded = false;
-        let mut dir = path.as_str();
-        while let Some((parent, _)) = dir.rsplit_once('/') {
-            expanded |= self.set_dir_expanded(parent, true);
-            dir = parent;
-        }
-        if expanded {
-            // Search never returns an ignored path, so no worktree walk is needed.
-            self.rebuild_file_rows();
-        }
-        self.reset_diff_view();
-        self.set_file_view(&path);
-        if let Some(fi) = self.file_row_of_path(&path) {
-            self.file_cursor = fi;
-            self.reveal_files = true;
-        }
+        // A pick opens as a tree click does, a code hit at its line.
+        self.point_at(&path);
+        self.reload_open_view();
         self.focus = Focus::Diff;
         if let Some(line) = line {
-            // Rendered, land on the block holding the line.
-            let last = self.visible.len().saturating_sub(1);
-            self.diff_cursor = if self.rendered_active() {
-                let line = u32::try_from(line).unwrap_or(u32::MAX);
-                self.rendered.index.row_at_line(line).unwrap_or(0)
-            } else {
-                (line.saturating_sub(1) as usize).min(last)
-            };
+            self.land_worktree_line(u32::try_from(line).unwrap_or(u32::MAX));
         }
-        self.reveal_diff = true;
         Ok(())
     }
 
@@ -5072,6 +5192,7 @@ impl App {
         // `send` closes row 1 once a comment exists.
         if !self.store.is_empty() {
             out.push((A::Send, Send));
+            out.push((A::SendTo, Do));
         }
 
         // The `go` band: keys that work anywhere, never repeating row 1.
@@ -5148,13 +5269,13 @@ fn armed_row(rows: &[AgentChoice], last_sent: Option<&str>) -> usize {
 }
 
 impl App {
-    /// `Send`: one agent sends, several open the picker, none points at the clipboard.
-    pub fn send_to_agent(&mut self) {
+    /// `Send`, through the picker when `choose` (`send-to`); no agent points at the clipboard.
+    pub fn send_to_agent(&mut self, choose: bool) {
         if self.store.is_empty() {
             self.status = "no comments yet".to_string();
             return;
         }
-        match herdr::send_target(&self.herdr.ids) {
+        match herdr::send_target(&self.herdr.ids, choose) {
             Ok(SendTarget::One(agent)) => self.export_to_agent(&agent),
             Ok(SendTarget::Many(rows)) => self.open_picker(rows),
             Err(e) => self.status = crate::export::send_failure(&e, None, &self.copy_key()),
@@ -5219,7 +5340,7 @@ impl App {
 fn kept_why(error: &crate::herdr::SendError) -> &'static str {
     use crate::herdr::{HerdrError, SendError};
     match error {
-        SendError::AtPrompt(_) => "agent is waiting for a confirmation",
+        SendError::AtPrompt => "agent is waiting for a confirmation",
         SendError::Dialog => "agent has a dialog open",
         SendError::NoAgent => "no agent here",
         SendError::Herdr(HerdrError::Unanswered) => "herdr did not answer",
@@ -5228,10 +5349,11 @@ fn kept_why(error: &crate::herdr::SendError) -> &'static str {
 }
 
 impl App {
-    /// `deliver = "immediate"`: put the comment just saved at `idx` into the agent's input, unsent.
-    /// One agent takes it; several reuse the last-sent pane, else the picker. A miss keeps it.
+    /// `deliver = "immediate"`: the comment just saved goes into the agent's input, unsent.
+    /// One agent, or the one beside reviewr, takes it; several reuse the last sent, else the picker.
     fn deliver_one(&mut self, idx: usize) {
-        match herdr::send_target(&self.herdr.ids) {
+        // Not a chosen send: the picker opens only when no single agent is the target.
+        match herdr::send_target(&self.herdr.ids, false) {
             Ok(SendTarget::One(agent)) => self.deliver_to(idx, &agent),
             Ok(SendTarget::Many(rows)) => {
                 let last = self.last_sent_pane.as_deref();
@@ -5817,6 +5939,24 @@ fn keep_in_view(cursor: usize, scroll: usize, heights: &[usize], viewport: usize
     top
 }
 
+/// [`keep_in_view`] that also keeps `off` lines above and below `cursor`, capped at half the pane.
+fn keep_in_view_off(
+    cursor: usize,
+    scroll: usize,
+    heights: &[usize],
+    viewport: usize,
+    off: usize,
+) -> usize {
+    if viewport == 0 || heights.is_empty() || off == 0 {
+        return keep_in_view(cursor, scroll, heights, viewport);
+    }
+    let cursor = cursor.min(heights.len() - 1);
+    let off = off.min(viewport.saturating_sub(heights[cursor]) / 2);
+    let below = off.min(heights[cursor + 1..].iter().sum());
+    let top = keep_in_view(cursor, scroll, heights, viewport - below);
+    top.min(top_leaving(heights, cursor, off))
+}
+
 /// Clamp a scroll so the window shows no blank tail.
 fn bound(scroll: usize, total: usize, viewport: usize) -> usize {
     scroll.min(total.saturating_sub(viewport))
@@ -6120,6 +6260,24 @@ mod tests {
     use crate::test_support::test_repo;
     use crate::world::{PickStatus, PickVerdict};
     use std::path::PathBuf;
+
+    #[test]
+    fn scrolloff_keeps_lines_around_the_cursor_and_centers_when_large() {
+        use super::keep_in_view_off as k;
+        let h = [1; 100];
+        // Off is 0: the minimal scroll, unchanged.
+        assert_eq!(k(30, 0, &h, 20, 0), 11);
+        // Moving down keeps 8 lines below; moving up keeps 8 above.
+        assert_eq!(k(30, 0, &h, 20, 8), 19);
+        assert_eq!(k(30, 40, &h, 20, 8), 22);
+        // Inside the margin band nothing scrolls.
+        assert_eq!(k(30, 20, &h, 20, 8), 20);
+        // A huge off centers: 10 above, 9 below in a 20-line pane.
+        assert_eq!(k(30, 0, &h, 20, 999), 20);
+        assert_eq!(k(31, 20, &h, 20, 999), 21);
+        // At the top there is nothing above to keep.
+        assert_eq!(k(2, 0, &h, 20, 999), 0);
+    }
 
     #[test]
     fn a_pr_settled_highlight_survives_a_kept_snapshot_and_blanks_on_a_replace() {
@@ -6616,8 +6774,13 @@ mod tests {
                 "navigator, on a directory row",
                 Box::new(|a: &mut App| {
                     a.focus = crate::Focus::Files;
-                    a.file_rows[0].kind =
-                        RowKind::Dir { path: "src".into(), expanded: true, has_change: false };
+                    a.file_rows[0].kind = RowKind::Dir {
+                        path: "src".into(),
+                        expanded: true,
+                        has_change: false,
+                        additions: 0,
+                        deletions: 0,
+                    };
                 }),
                 None,
             ),

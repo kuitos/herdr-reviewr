@@ -60,7 +60,10 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 16] = [
+/// Lines a keyboard move keeps between the diff cursor and the pane's edges, unless configured.
+pub const DEFAULT_SCROLLOFF: usize = 3;
+
+const PLUGIN_CONFIG_KEYS: [&str; 18] = [
     "theme",
     "default_scope",
     "markdown_view",
@@ -69,6 +72,8 @@ const PLUGIN_CONFIG_KEYS: [&str; 16] = [
     "toggle_placement",
     "toggle_direction",
     "auto_open",
+    "follow_file_across_tabs",
+    "scrolloff",
     "github_host",
     "gitlab_host",
     "azure_devops_host",
@@ -198,6 +203,8 @@ pub struct PluginConfig {
     toggle_placement: TogglePlacement,
     toggle_direction: ToggleDirection,
     auto_open: bool,
+    follow_file_across_tabs: bool,
+    scrolloff: usize,
     github_host: Option<String>,
     gitlab_host: Option<String>,
     azure_devops_host: Option<String>,
@@ -219,6 +226,8 @@ impl Default for PluginConfig {
             toggle_placement: TogglePlacement::Split,
             toggle_direction: ToggleDirection::Right,
             auto_open: true,
+            follow_file_across_tabs: true,
+            scrolloff: DEFAULT_SCROLLOFF,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -265,6 +274,16 @@ impl PluginConfig {
 
     pub fn auto_open(&self) -> bool {
         self.auto_open
+    }
+
+    /// Whether a switch between `Changes` and `All files` opens the file and line left.
+    pub fn follow_file_across_tabs(&self) -> bool {
+        self.follow_file_across_tabs
+    }
+
+    /// Lines kept above and below the diff cursor, as vim's `scrolloff`; a large value centers it.
+    pub fn scrolloff(&self) -> usize {
+        self.scrolloff
     }
 
     pub fn github_host(&self) -> Option<&str> {
@@ -481,6 +500,17 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("auto_open") {
         config.auto_open =
             value.as_bool().ok_or_else(|| value_error(path, value, "auto_open", "a boolean"))?;
+    }
+    if let Some(value) = table.get("follow_file_across_tabs") {
+        config.follow_file_across_tabs = value
+            .as_bool()
+            .ok_or_else(|| value_error(path, value, "follow_file_across_tabs", "a boolean"))?;
+    }
+    if let Some(value) = table.get("scrolloff") {
+        config.scrolloff = value
+            .as_integer()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| value_error(path, value, "scrolloff", "a non-negative integer"))?;
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -812,6 +842,7 @@ mod tests {
         assert_eq!(config.toggle_placement(), TogglePlacement::Split);
         assert_eq!(config.toggle_direction(), ToggleDirection::Right);
         assert!(config.auto_open());
+        assert!(config.follow_file_across_tabs());
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
         assert_eq!(config.deliver(), Deliver::Batch);
@@ -831,6 +862,7 @@ mod tests {
                 "toggle_placement = \"overlay\"\n",
                 "toggle_direction = \"down\"\n",
                 "auto_open = false\n",
+                "follow_file_across_tabs = false\n",
                 "github_host = \"GitHub.Example.COM\"\n",
                 "deliver = \"immediate\"\n",
                 "markdown_view = \"rendered\"\n",
@@ -847,6 +879,7 @@ mod tests {
         assert_eq!(config.toggle_placement(), TogglePlacement::Overlay);
         assert_eq!(config.toggle_direction(), ToggleDirection::Down);
         assert!(!config.auto_open());
+        assert!(!config.follow_file_across_tabs());
         assert_eq!(config.github_host(), Some("github.example.com"));
         assert_eq!(config.deliver(), Deliver::Immediate);
     }
@@ -929,6 +962,9 @@ mod tests {
             ("toggle_placement = \"left\"\n", "`toggle_placement`"),
             ("toggle_direction = \"left\"\n", "`toggle_direction`"),
             ("auto_open = \"yes\"\n", "`auto_open`"),
+            ("follow_file_across_tabs = \"no\"\n", "`follow_file_across_tabs`"),
+            ("scrolloff = -1\n", "`scrolloff`"),
+            ("scrolloff = \"8\"\n", "`scrolloff`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
             ("editor = \"   \"\n", "`editor`"),
@@ -1043,7 +1079,11 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
         assert_eq!(keymap.action_for(Key::plain('x')), Some(Action::Send));
         assert_eq!(keymap.action_for(Key::plain('s')), None, "a binding replaces its defaults");
-        assert_eq!(keymap.action_for(Key::plain('S')), None);
+        assert_eq!(
+            keymap.action_for(Key::plain('S')),
+            Some(Action::SendTo),
+            "`send-to` keeps its own"
+        );
         assert_eq!(keymap.action_for(Key::plain('v')), Some(Action::Select), "unbound keep theirs");
     }
 
@@ -1131,6 +1171,27 @@ mod tests {
             error.contains("`expand`") && error.contains("`comments`") && error.contains('l'),
             "{error}"
         );
+    }
+
+    #[test]
+    fn switch_pane_rebinds_and_tab_is_a_key_name() {
+        use crate::keymap::{Action, Key, KeyCode};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let tab = Key::named(KeyCode::Tab);
+        assert_eq!(PluginConfig::default().keymap().action_for(tab), Some(Action::SwitchPane));
+
+        // `l` is `comments` by default, so taking it names both.
+        std::fs::write(&path, "[keybindings]\nswitch-pane = [\"l\"]\n").unwrap();
+        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("`switch-pane`") && error.contains("`comments`"), "{error}");
+
+        // A freed `tab` can serve another action.
+        std::fs::write(&path, "[keybindings]\nswitch-pane = [\"h\"]\nnext-file = [\"tab\"]\n")
+            .unwrap();
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.keymap().action_for(Key::plain('h')), Some(Action::SwitchPane));
+        assert_eq!(config.keymap().action_for(tab), Some(Action::NextFile));
     }
 
     #[test]
@@ -1230,7 +1291,8 @@ mod tests {
         assert_eq!(config.keymap().bindings().len(), Action::names().count());
         assert!(config.keymap().bindings().iter().all(|(_, keys)| !keys.is_empty()));
         assert_eq!(keys_of(&config, Action::Quit), ["q"]);
-        assert_eq!(keys_of(&config, Action::Send), ["s", "S"]);
+        assert_eq!(keys_of(&config, Action::Send), ["s"]);
+        assert_eq!(keys_of(&config, Action::SendTo), ["S"]);
     }
 
     /// `action`'s keys in `config`, spelled as the config file spells them.
