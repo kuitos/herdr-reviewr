@@ -14,7 +14,7 @@ use ratatui::widgets::{
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Band, Focus, FooterAction, Mode, Question, Tab};
+use crate::app::{App, Band, Focus, FooterAction, Mode, Question, Tab, WorldLoad};
 use crate::config::NavigatorPosition;
 use crate::diff::{FileDiff, MarkerKind, Notice, RenderedKind, Row};
 use crate::file_list::RowKind;
@@ -460,7 +460,7 @@ fn seg_cell_range(
     if matches!(row, Row::Rendered { .. }) {
         (0, cells.len())
     } else if app.wrap {
-        let segs = wrap_segments(cells, code_width.max(1), ContinuationSpaces::Trim);
+        let segs = wrap_segments(cells, code_width.max(1), ContinuationSpaces::Trim, Cell::glyph);
         segs.get(seg).copied().unwrap_or((0, 0))
     } else {
         unwrapped_range(cells, app.h_scroll, code_width)
@@ -1107,7 +1107,7 @@ fn box_rows(input: &str, width: usize) -> Vec<(usize, String)> {
     loop {
         let line_end = chars[i..].iter().position(|&c| c == '\n').map_or(chars.len(), |p| i + p);
         let cells: Vec<Cell> = chars[i..line_end].iter().copied().map(plain_cell).collect();
-        let segments = wrap_segments(&cells, width, ContinuationSpaces::Keep);
+        let segments = wrap_segments(&cells, width, ContinuationSpaces::Keep, Cell::glyph);
         for &(a, b) in &segments {
             rows.push((i + a, chars[i + a..i + b].iter().collect::<String>()));
         }
@@ -1233,7 +1233,7 @@ pub fn caret_vertical(input: &str, caret: usize, content_w: usize, down: bool) -
 /// Word-wrap a plain string by the diff's own [`wrap_segments`] rule.
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
     let cells: Vec<Cell> = s.chars().map(plain_cell).collect();
-    wrap_segments(&cells, width, ContinuationSpaces::Trim)
+    wrap_segments(&cells, width, ContinuationSpaces::Trim, Cell::glyph)
         .into_iter()
         .map(|(a, b)| cells[a..b].iter().map(|c| c.ch).collect())
         .collect()
@@ -1417,6 +1417,9 @@ fn base_parts(app: &App, keymap: &Keymap, width: u16) -> Option<(String, String,
 
 /// The header suffix: the changed-file count and line totals, measured by display width.
 fn header_suffix(app: &App) -> String {
+    if app.world_load != WorldLoad::Landed {
+        return String::new();
+    }
     let (added, removed) = app.changed_totals();
     let stats = stats_str(added, removed);
     let gap = if stats.is_empty() { "" } else { "  " };
@@ -1531,7 +1534,13 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
     if app.file_rows.is_empty() {
         let gone = app.commits_gone_message();
         let plain = not_a_repo_message(app.keymap());
+        let failed = format!(
+            "load failed, {} retries",
+            app.keymap().hint(crate::keymap::Action::Refresh).label()
+        );
         let msg = match app.tab {
+            _ if app.world_load == WorldLoad::Pending => "",
+            _ if app.world_load == WorldLoad::Failed => failed.as_str(),
             Tab::AllFiles => "no files",
             Tab::Changes if app.repo_kind == RepoKind::Plain => plain.as_str(),
             Tab::Changes if app.awaiting_turn() => app.turn_wait_message(),
@@ -1559,7 +1568,7 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
             };
             let nest = "  ".repeat(row.depth);
             match &row.kind {
-                RowKind::Dir { expanded, has_change, .. } => {
+                RowKind::Dir { expanded, has_change, additions, deletions, .. } => {
                     let arrow = if *expanded { "▾ " } else { "▸ " };
                     // A git-ignored directory recedes into a dim, unbolded row.
                     let name_style = if row.ignored {
@@ -1569,22 +1578,28 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                             .fg(p.ink(Ink::TextSecondary, on))
                             .add_modifier(Modifier::BOLD)
                     };
-                    // Elide the bare name, then add `/`: eliding `name/` would leave `…/`.
-                    let reserve = if app.tab == Tab::AllFiles { DIR_DOT_RESERVE } else { 0 };
+                    // A collapsed folder sums what it hides: lines on Changes, a dot on All files.
+                    let all_files = app.tab == Tab::AllFiles;
+                    let stats =
+                        if *expanded { String::new() } else { stats_str(*additions, *deletions) };
+                    let reserve = if all_files { DIR_DOT_RESERVE } else { stats_reserve(&stats) };
                     let lead = format!("{nest}{arrow}");
                     let budget = width.saturating_sub(lead.width() + reserve + 1).max(1);
+                    // Elide the bare name, then add `/`: eliding `name/` would leave `…/`.
                     let name = format!("{}/", elide_head(&row.name, budget));
                     let mut spans = vec![
                         Span::styled(lead, Style::default().fg(p.ink(Ink::TextMuted, on))),
                         Span::styled(name, name_style),
                     ];
-                    // Only collapsed `All files` folders need the dot.
-                    if app.tab == Tab::AllFiles && !expanded && *has_change {
-                        let used: usize = spans.iter().map(Span::width).sum();
-                        spans.push(Span::raw(" ".repeat(width.saturating_sub(used + 1))));
-                        // Modified's hue, the neutral one.
-                        let hue = kind_color(p, ChangeKind::Modified, on);
-                        spans.push(Span::styled(DIR_DOT, Style::default().fg(hue)));
+                    if all_files {
+                        if !expanded && *has_change {
+                            // Modified's hue, the neutral one.
+                            let hue = kind_color(p, ChangeKind::Modified, on);
+                            let dot = Span::styled(DIR_DOT, Style::default().fg(hue));
+                            push_at_end(&mut spans, width, vec![dot]);
+                        }
+                    } else if !stats.is_empty() {
+                        push_at_end(&mut spans, width, stats_spans(*additions, *deletions, p, on));
                     }
                     selectable_row(p, spans, width, on)
                 }
@@ -1626,8 +1641,7 @@ fn file_row_item(row: &FileRowSpec<'_>, width: usize, on: Fill, p: &Palette) -> 
     let marker = annotation.map_or(String::new(), |a| format!("{} ", a.kind.marker()));
     let (additions, deletions) = annotation.map_or((0, 0), |a| (a.additions, a.deletions));
     let stats = stats_str(additions, deletions);
-    let gap = if stats.is_empty() { 0 } else { 2 };
-    let fixed = indent.width() + marker.width() + stats.width() + gap;
+    let fixed = indent.width() + marker.width() + stats_reserve(&stats);
     let shown = elide_head(name, width.saturating_sub(fixed).max(1));
 
     let mut spans = vec![Span::styled(indent.to_string(), text_style(p, on))];
@@ -1656,12 +1670,24 @@ fn file_row_item(row: &FileRowSpec<'_>, width: usize, on: Fill, p: &Palette) -> 
         }));
     }
     if !stats.is_empty() {
-        let used: usize = spans.iter().map(Span::width).sum();
-        let pad = width.saturating_sub(used + stats.width());
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.extend(stats_spans(additions, deletions, p, on));
+        push_at_end(&mut spans, width, stats_spans(additions, deletions, p, on));
     }
     selectable_row(p, spans, width, on)
+}
+
+/// The least space between a file list name and its line stats.
+const STATS_GAP: usize = 2;
+
+/// The columns a row's line stats take, with their gap; none without stats.
+fn stats_reserve(stats: &str) -> usize {
+    if stats.is_empty() { 0 } else { stats.width() + STATS_GAP }
+}
+
+/// Pad `spans` so `tail` ends at column `width`, then append `tail`.
+fn push_at_end(spans: &mut Vec<Span<'static>>, width: usize, tail: Vec<Span<'static>>) {
+    let used: usize = spans.iter().chain(&tail).map(Span::width).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    spans.extend(tail);
 }
 
 /// The `+a −d` stats text, a zero side dropped.
@@ -1801,6 +1827,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         // `All files` is no diff, so its copy avoids diff words.
         let gone = app.commits_gone_message();
         let msg = match app.tab {
+            _ if app.world_load != WorldLoad::Landed => "",
             Tab::AllFiles => match app.diff.notice {
                 Some(notice) => notice.message(),
                 None if app.diff_path.is_some() => "empty file",
@@ -1954,7 +1981,7 @@ fn row_height(row: &Row, gutter_w: usize, width: usize, wrap: bool) -> usize {
     }
     let code_width = width.saturating_sub(gutter_prefix_width(gutter_w)).max(1);
     // The find highlight never changes wrapping, so height ignores it.
-    wrap_segments(&plain_cells(row), code_width, ContinuationSpaces::Trim).len()
+    wrap_segments(&plain_cells(row), code_width, ContinuationSpaces::Trim, Cell::glyph).len()
 }
 
 /// The narrowest read pane that shows split: two 60-column halves, the longest file's gutters.
@@ -2248,7 +2275,7 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState<'_>) -> Vec<Line
     let prefix_w = gutter_prefix_width(gutter_w);
     let code_width = width.saturating_sub(prefix_w).max(1);
     let chunks: Vec<&[Cell]> = if wrap {
-        wrap_segments(&cells, code_width, ContinuationSpaces::Trim)
+        wrap_segments(&cells, code_width, ContinuationSpaces::Trim, Cell::glyph)
             .into_iter()
             .map(|(s, e)| &cells[s..e])
             .collect()
@@ -2402,7 +2429,7 @@ pub(crate) fn rgb(c: crate::diff::Rgb) -> Color {
 const TAB: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ContinuationSpaces {
+pub(crate) enum ContinuationSpaces {
     Keep,
     Trim,
 }
@@ -2420,10 +2447,11 @@ fn plain_cell(ch: char) -> Cell {
 }
 
 /// Greedy word wrap into one cell range per row, hard-breaking an over-wide word.
-fn wrap_segments(
-    cells: &[Cell],
+pub(crate) fn wrap_segments<T>(
+    cells: &[T],
     width: usize,
     continuation_spaces: ContinuationSpaces,
+    glyph: impl Fn(&T) -> (char, usize),
 ) -> Vec<(usize, usize)> {
     if cells.is_empty() {
         return vec![(0, 0)];
@@ -2435,7 +2463,7 @@ fn wrap_segments(
         let mut col = 0;
         let mut limit = start;
         while limit < cells.len() {
-            let cw = cells[limit].w;
+            let cw = glyph(&cells[limit]).1;
             if col + cw > width && limit > start {
                 break;
             }
@@ -2447,12 +2475,12 @@ fn wrap_segments(
             break;
         }
         // More cells follow; prefer breaking just after the last space that fits.
-        let brk = (start..limit).rev().find(|&i| cells[i].ch == ' ').map(|i| i + 1);
+        let brk = (start..limit).rev().find(|&i| glyph(&cells[i]).0 == ' ').map(|i| i + 1);
         let end = brk.filter(|&e| e > start).unwrap_or(limit);
         segs.push((start, end));
         start = end;
         if continuation_spaces == ContinuationSpaces::Trim {
-            while start < cells.len() && cells[start].ch == ' ' {
+            while start < cells.len() && glyph(&cells[start]).0 == ' ' {
                 start += 1;
             }
         }
@@ -2482,6 +2510,12 @@ struct Cell {
     quoted: bool,
     /// The source char this cell paints; a tab's cells share one.
     src: usize,
+}
+
+impl Cell {
+    fn glyph(&self) -> (char, usize) {
+        (self.ch, self.w)
+    }
 }
 
 /// A row's display cells: tab-expanded, width-measured, emphasis and find flags, plus any CR marker.
@@ -2927,7 +2961,8 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::ExpandDir => (hint(K::Expand), "expand"),
         A::CollapseDir => (hint(K::Collapse), "collapse"),
         A::TogglePane => {
-            return ("tab".into(), if app.focus == Focus::Files { "diff" } else { "files" }.into());
+            let to = if app.focus == Focus::Files { "diff" } else { "files" };
+            return (hint(K::SwitchPane), to.into());
         }
         A::Rendered => {
             (hint(K::Rendered), if app.rendered_active() { "source" } else { "rendered" })
@@ -2947,6 +2982,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             "scope",
         ),
         A::Send => return (hint(K::Send), format!("send {}", app.store.len())),
+        A::SendTo => (hint(K::SendTo), "pick agent"),
         A::List => (hint(K::Comments), "comments"),
         A::Copy => (hint(K::Copy), "copy"),
         A::QuitDiscard => {

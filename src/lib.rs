@@ -90,7 +90,8 @@ pub fn run() -> Result<()> {
 /// Review until quit, restarting on each switch's pick in the same pane.
 fn review(screen: &mut Screen, cfg: &mut Config, app: &mut App) -> Result<()> {
     let mut _session = git::lease_session(&app.repo);
-    paint_then_load(&mut screen.terminal, app)?;
+    enter_repo(cfg, app);
+    paint_then_request_load(&mut screen.terminal, app)?;
     // An old command line hears what changed instead of quietly doing something else.
     if let Some(note) = &cfg.removed_flag {
         app.status.clone_from(note);
@@ -101,9 +102,10 @@ fn review(screen: &mut Screen, cfg: &mut Config, app: &mut App) -> Result<()> {
         event_loop(screen, app, cfg, &mut open_editors)?;
         let Some(switched) = switched_app(cfg, app) else { return Ok(()) };
         *app = switched;
+        enter_repo(cfg, app);
         // The old worktree's session ends once its workers finish too.
         _session = git::lease_session(&app.repo);
-        paint_then_load(&mut screen.terminal, app)?;
+        paint_then_request_load(&mut screen.terminal, app)?;
     }
 }
 
@@ -266,13 +268,14 @@ fn invalidate_screen(terminal: &mut DefaultTerminal) -> Result<()> {
 }
 
 /// The reviewed directory's top level, one spelling for the app and the worker; else as given.
-/// A non-repo path is canonicalized and marked plain, so the pane opens on All files.
+/// A non-repo path is absolute and marked plain, so the pane opens on All files.
 fn repo_root(cfg: &Config) -> (std::path::PathBuf, Option<crate::world::RepoKind>) {
     use crate::world::RepoKind;
     match git::worktree_of(&cfg.repo) {
         git::Worktree::Root(root) => (root, Some(RepoKind::Git)),
         verdict => {
-            let path = std::fs::canonicalize(&cfg.repo).unwrap_or_else(|_| cfg.repo.clone());
+            // Absolute, so entering it (`enter_repo`) never shifts what a relative path names.
+            let path = std::path::absolute(&cfg.repo).unwrap_or_else(|_| cfg.repo.clone());
             (path, (verdict == git::Worktree::Outside).then_some(RepoKind::Plain))
         }
     }
@@ -319,14 +322,28 @@ pub fn switched_app(cfg: &mut Config, old: &mut App) -> Option<App> {
     Some(app)
 }
 
-/// Paint, then load, so a hung `git` never leaves a blank or stale pane (issue #4).
-fn paint_then_load(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+/// Work in the reviewed repo: herdr reports a pane's folder from its process, and the actions
+/// match a `tab`-placement reviewr to a worktree by it.
+fn enter_repo(cfg: &mut Config, app: &App) {
+    // A relative `cfg.repo` would name another folder from inside, so a recovery rereads this one.
+    cfg.repo.clone_from(&app.repo);
+    if let Err(e) = std::env::set_current_dir(&app.repo) {
+        logln!("chdir to {} failed: {e}", app.repo.display());
+    }
+}
+
+/// Paint, then hand the first load to the world worker: a hung `git` never leaves a blank pane
+/// (issue #4), and the loop answers a resize while it loads (herdr resizes a fresh pane).
+fn paint_then_request_load<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     terminal.draw(|f| ui::render(f, app))?;
-    if app.config_error().is_none()
-        && let Err(e) = app.reload()
-    {
-        logln!("reload failed: {e:#}");
-        app.status = format!("load failed: {e}");
+    if app.config_error().is_none() {
+        app.request_world_refresh(false);
     }
     Ok(())
 }
@@ -758,6 +775,7 @@ pub fn land_world_completion(
         }
         Some(Err(e)) => {
             app.status = format!("refresh failed: {e}");
+            app.load_failed();
             Landing::Failed(completion.refresh)
         }
         None => Landing::Landed,
@@ -1064,6 +1082,7 @@ fn event_loop(
                         Err(mpsc::TryRecvError::Disconnected) if world_live.running.is_some() => {
                             world_live.running = None;
                             app.status = "refresh worker unavailable".to_string();
+                            app.load_failed();
                             break;
                         }
                         Err(_) => break,
@@ -1201,6 +1220,7 @@ fn event_loop(
                 if world_tx.send(job).is_err() {
                     // A dead worker must not pin the in-flight marker.
                     app.status = "refresh worker unavailable".to_string();
+                    app.load_failed();
                     world_live.running = None;
                 }
             }
@@ -1699,6 +1719,17 @@ const HALF_PAGE: isize = 8;
 
 /// Apply one readline-style key to the active text field; `word` moves by word.
 fn apply_text_edit(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bool) {
+    if !edit_command(app, code, ctrl, alt, word)
+        && let KeyCode::Char(c) = code
+        && !ctrl
+        && !alt
+    {
+        app.input_push(c);
+    }
+}
+
+/// The caret moves and deletes every text field shares, readline's; `false` when `code` is none.
+fn edit_command(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bool) -> bool {
     use KeyCode::{Backspace, Char, Delete, End, Home, Left, Right};
     match code {
         Char('w') if ctrl => app.input_delete_word(),
@@ -1709,17 +1740,19 @@ fn apply_text_edit(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bo
         // `Alt+b`/`Alt+f` survive multiplexers that strip modified arrows.
         Char('b') if alt => app.caret_word_left(),
         Char('f') if alt => app.caret_word_right(),
+        Char('d') | Delete if alt => app.input_delete_word_forward(),
         Left if word => app.caret_word_left(),
         Right if word => app.caret_word_right(),
         Left => app.caret_left(),
         Right => app.caret_right(),
         Home => app.caret_home(),
         End => app.caret_end(),
+        Backspace if alt => app.input_delete_word(),
         Delete => app.input_delete_forward(),
         Backspace => app.input_backspace(),
-        Char(c) if !ctrl => app.input_push(c),
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 /// Map one key press onto `App` through the painted frame's `keymap`.
@@ -1787,24 +1820,16 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
-    // Line field: digits or `$` edit, Enter jumps, Esc closes, the rest is inert.
+    // Line field: digits or `$` type, the shared edits edit, Enter jumps, Esc closes.
     if app.line_open() {
-        let plain = !ctrl && !key.modifiers.contains(KeyModifiers::ALT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             Esc => app.close_find(),
             Enter => app.line_go(),
-            Char(c @ ('0'..='9' | '$')) if plain => app.line_type(c),
-            code @ (KeyCode::Backspace
-            | KeyCode::Delete
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End)
-                if plain =>
-            {
-                apply_text_edit(app, code, false, false, false);
+            Char(c @ ('0'..='9' | '$')) if !ctrl && !alt => app.line_type(c),
+            code => {
+                edit_command(app, code, ctrl, alt, alt || ctrl);
             }
-            _ => {}
         }
         return Ok(());
     }
@@ -1821,7 +1846,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
-    // Bound keys resolve through the keymap; the rest fall to the fixed `tab` and `esc`.
+    // Bound keys resolve through the keymap; the rest fall to the fixed `esc`.
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let code = match key.code {
         Char(c) => Some(keymap::KeyCode::Char(c)),
@@ -1831,6 +1856,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         Down => Some(keymap::KeyCode::Down),
         PageUp => Some(keymap::KeyCode::PageUp),
         PageDown => Some(keymap::KeyCode::PageDown),
+        Tab => Some(keymap::KeyCode::Tab),
         _ => None,
     };
     let action = code.and_then(|code| keymap.action_for(crate::keymap::Key { ctrl, alt, code }));
@@ -1845,7 +1871,12 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             Some(K::Send) => {
                 app.close_worktree_picker();
                 app.question = None;
-                app.send_to_agent();
+                app.send_to_agent(false);
+            }
+            Some(K::SendTo) => {
+                app.close_worktree_picker();
+                app.question = None;
+                app.send_to_agent(true);
             }
             Some(K::Copy) => {
                 app.close_worktree_picker();
@@ -1938,7 +1969,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             (Some(K::Up), _) => app.pr_move(-1),
             (Some(K::Keys), _) => app.toggle_keys(),
             (_, Esc) => app.escape(),
-            (_, Tab) => app.toggle_focus(),
+            (Some(K::SwitchPane), _) => app.toggle_focus(),
             (Some(K::PageDown), _) if app.focus == Focus::Files => app.pr_scroll_nav(PAGE),
             (Some(K::PageUp), _) if app.focus == Focus::Files => app.pr_scroll_nav(-PAGE),
             (Some(K::PageDown), _) => app.pr_scroll_read(PAGE),
@@ -1956,7 +1987,8 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             (Some(K::Comments), _) | (_, Esc) => app.close_list(),
             (Some(K::Down), _) => app.list_move(1),
             (Some(K::Up), _) => app.list_move(-1),
-            (Some(K::Send), _) => app.send_to_agent(),
+            (Some(K::Send), _) => app.send_to_agent(false),
+            (Some(K::SendTo), _) => app.send_to_agent(true),
             (Some(K::Copy), _) => {
                 app.export(&Clipboard);
             }
@@ -1992,6 +2024,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::PageUp => app.move_cursor(-PAGE)?,
             K::HalfDown => app.move_cursor(HALF_PAGE)?,
             K::HalfUp => app.move_cursor(-HALF_PAGE)?,
+            K::SwitchPane => app.toggle_focus(),
             K::NextHunk => app.next_hunk(),
             K::PrevHunk => app.prev_hunk(),
             K::NextFile => app.next_file(),
@@ -2016,7 +2049,8 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             // `delete` needs the diff focused, never an off-screen cursor; `edit` works anywhere.
             K::Edit => app.start_edit(),
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
-            K::Send => app.send_to_agent(),
+            K::Send => app.send_to_agent(false),
+            K::SendTo => app.send_to_agent(true),
             K::Copy => {
                 app.export(&Clipboard);
             }
@@ -2033,11 +2067,9 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
-    match key.code {
-        Tab => app.toggle_focus(),
-        // `esc` peels one layer: selection, armed crossing, footer expansion.
-        Esc => app.escape(),
-        _ => {}
+    // `esc` peels one layer: selection, armed crossing, footer expansion.
+    if key.code == Esc {
+        app.escape();
     }
     Ok(())
 }
@@ -2743,6 +2775,21 @@ mod refresh_tests {
         world_indicator,
     };
     use crate::app::{App, Question, Tab};
+
+    /// `path` spelled relative to the process cwd, so a startup test can pass a non-absolute repo.
+    fn path_relative_to_cwd(path: &std::path::Path) -> std::path::PathBuf {
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let mut ups = std::path::PathBuf::new();
+        let mut base = cwd.as_path();
+        loop {
+            if let Ok(rest) = path.strip_prefix(base) {
+                return if rest.as_os_str().is_empty() { ups } else { ups.join(rest) };
+            }
+            ups.push("..");
+            base = base.parent().expect("the directory and the cwd share a root");
+        }
+    }
 
     #[test]
     fn a_recovery_saved_over_twice_recovers_to_the_newest_config() {
@@ -3611,6 +3658,25 @@ mod refresh_tests {
     }
 
     #[test]
+    fn a_relative_plain_path_stays_absolute_and_opens_on_all_files() {
+        use crate::config::{Config, plugin_config_in};
+        use crate::world::RepoKind;
+        let plain = tempfile::tempdir().unwrap();
+        let relative = path_relative_to_cwd(plain.path());
+        assert!(relative.is_relative(), "{}", relative.display());
+        let cfg = Config::parse([relative.display().to_string()]);
+        let config_dir = tempfile::tempdir().unwrap();
+        let app = ready_app(&cfg, plugin_config_in(config_dir.path()).unwrap());
+        assert!(app.repo.is_absolute(), "entering it must not shift a relative path");
+        assert_eq!(app.repo_kind, RepoKind::Plain);
+        assert_eq!(app.tab, Tab::AllFiles);
+        assert_eq!(
+            std::fs::canonicalize(&app.repo).unwrap(),
+            std::fs::canonicalize(plain.path()).unwrap()
+        );
+    }
+
+    #[test]
     fn only_a_layout_or_theme_change_or_a_block_ends_a_gesture() {
         use crate::config::plugin_config_in;
         let dir = tempfile::tempdir().unwrap();
@@ -3759,5 +3825,125 @@ mod refresh_tests {
         let canonical = crate::git::canonical;
         assert_eq!(canonical(&recovered.repo), canonical(&wt), "the switched worktree");
         assert_eq!(canonical(&recovered.home), canonical(dir.path()), "where the pane opened");
+    }
+}
+
+#[cfg(test)]
+mod text_edit_tests {
+    use super::apply_text_edit;
+    use crate::app::{App, Mode};
+    use crate::model::Scope;
+    use ratatui::crossterm::event::KeyCode;
+    use std::path::PathBuf;
+
+    fn composing(text: &str, caret: usize) -> App {
+        let mut app = App::new(PathBuf::from("."), Scope::Uncommitted, None);
+        app.mode = Mode::Composing { editing: None };
+        app.input = text.to_string();
+        app.caret = caret;
+        app
+    }
+
+    #[test]
+    fn alt_backspace_deletes_the_word_behind_the_caret() {
+        let mut app = composing("foo bar", 7);
+        apply_text_edit(&mut app, KeyCode::Backspace, false, true, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foo ", 4));
+    }
+
+    #[test]
+    fn alt_delete_deletes_the_word_ahead_of_the_caret() {
+        let mut app = composing("foo bar", 0);
+        apply_text_edit(&mut app, KeyCode::Delete, false, true, false);
+        assert_eq!((app.input.as_str(), app.caret), (" bar", 0));
+        let mut app = composing("foo   bar", 3);
+        apply_text_edit(&mut app, KeyCode::Delete, false, true, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foo", 3), "skips the gap, then the word");
+        // `alt+d` is readline's name for the same delete.
+        let mut app = composing("foo bar", 3);
+        apply_text_edit(&mut app, KeyCode::Char('d'), false, true, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foo", 3));
+    }
+
+    #[test]
+    fn alt_letter_types_nothing_into_the_field() {
+        let mut app = composing("foo", 3);
+        apply_text_edit(&mut app, KeyCode::Char('x'), false, true, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foo", 3));
+    }
+
+    #[test]
+    fn ctrl_w_and_alt_word_jumps_still_work() {
+        let mut app = composing("foo bar", 7);
+        apply_text_edit(&mut app, KeyCode::Char('b'), false, true, false);
+        assert_eq!(app.caret, 4, "alt+b still jumps a word left");
+        apply_text_edit(&mut app, KeyCode::Char('f'), false, true, false);
+        assert_eq!(app.caret, 7, "alt+f still jumps a word right");
+        apply_text_edit(&mut app, KeyCode::Char('w'), true, false, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foo ", 4));
+    }
+
+    #[test]
+    fn plain_chars_backspace_and_delete_still_edit_one_char() {
+        let mut app = composing("foo", 3);
+        apply_text_edit(&mut app, KeyCode::Char('x'), false, false, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foox", 4));
+        apply_text_edit(&mut app, KeyCode::Backspace, false, false, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foo", 3));
+        apply_text_edit(&mut app, KeyCode::Delete, false, false, false);
+        assert_eq!((app.input.as_str(), app.caret), ("foo", 3), "nothing ahead, nothing lost");
+        app.caret = 0;
+        apply_text_edit(&mut app, KeyCode::Delete, false, false, false);
+        assert_eq!((app.input.as_str(), app.caret), ("oo", 0));
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::paint_then_request_load;
+    use crate::app::App;
+    use crate::model::Scope;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect()
+    }
+
+    #[test]
+    fn the_first_paint_claims_nothing_and_hands_the_load_to_the_worker() {
+        let (dir, git) = crate::test_support::test_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        paint_then_request_load(&mut terminal, &mut app).unwrap();
+        let first = screen(&terminal);
+        let claims = ["no changes", "0 changed", "loading"];
+        assert!(!claims.iter().any(|claim| first.contains(claim)), "{first}");
+        assert!(app.entries.is_empty(), "nothing loads before the frame loop runs");
+        let request = app.world_request.clone().expect("the first load is requested");
+        assert!(!request.background && request.refresh.is_full());
+
+        // A failed first build says so, rather than leaving the list blank.
+        app.load_failed();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        assert!(screen(&terminal).contains("load failed, r retries"));
+        // It names the key the reviewer bound.
+        let config_dir = tempfile::tempdir().unwrap();
+        let toml = "[keybindings]\nrefresh = [\"R\"]\n";
+        std::fs::write(config_dir.path().join("config.toml"), toml).unwrap();
+        app.set_plugin_config(crate::config::plugin_config_in(config_dir.path()).unwrap());
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        assert!(screen(&terminal).contains("load failed, R retries"));
+
+        // The worker's snapshot lands like any refresh, and the list fills.
+        app.reconcile_world(crate::world::build(&app.world_input()).unwrap());
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let loaded = screen(&terminal);
+        assert!(loaded.contains("a.txt") && !loaded.contains("load failed"), "{loaded}");
     }
 }

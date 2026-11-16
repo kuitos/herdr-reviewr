@@ -1362,6 +1362,44 @@ fn git_access_never_mutates_the_repo() {
     assert_eq!(status_before, r.git(&["status", "--porcelain"]), "working tree unchanged");
 }
 
+#[cfg(unix)]
+#[test]
+fn programs_the_repos_config_names_never_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Repo::init();
+    r.write(".gitattributes", "*.rs diff=conv\n");
+    r.write("a.rs", "x\n");
+    r.commit_all("init");
+    r.write("a.rs", "y\n");
+    r.write("untracked.rs", "u\n");
+
+    let git_dir = r.git(&["rev-parse", "--absolute-git-dir"]);
+    let git_dir = Path::new(git_dir.trim());
+    let marker = git_dir.join("ran");
+    let script = format!(
+        "#!/bin/sh\necho \"$0\" >> '{}'\ncat \"$1\" 2>/dev/null || true\n",
+        marker.display()
+    );
+    let hooks = git_dir.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    for name in ["fsmonitor", "post-index-change", "reference-transaction", "textconv"] {
+        let path = hooks.join(name);
+        std::fs::write(&path, &script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    r.git(&["config", "core.fsmonitor", hooks.join("fsmonitor").to_str().unwrap()]);
+    r.git(&["config", "diff.conv.textconv", hooks.join("textconv").to_str().unwrap()]);
+
+    changed_from(r.path(), "HEAD").unwrap();
+    diff_sides(r.path(), "HEAD", None, "a.rs", None).unwrap();
+    let tree = snapshot_worktree(r.path()).unwrap();
+    write_baseline_ref(r.path(), &tree).unwrap();
+    write_base_pick(r.path(), "main").unwrap();
+
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(ran.is_empty(), "repo-configured programs ran:\n{ran}");
+}
+
 // --- turn baseline (last-turn scope) -------------------------------------------
 
 #[test]
@@ -1560,6 +1598,21 @@ fn all_files_lists_tracked_untracked_and_ignored_dirs_collapsed() {
     let mut sorted = paths.clone();
     sorted.sort_unstable();
     assert_eq!(paths, sorted, "the listing is sorted");
+}
+
+#[test]
+fn all_files_lists_an_ignored_dir_under_an_untracked_dir() {
+    let r = Repo::init();
+    r.write(".gitignore", "notes/library/\n");
+    r.commit_all("init");
+    r.write("notes/index.md", "n\n"); // untracked parent, not ignored
+    r.write("notes/library/vendor/page.md", "v\n"); // ignored, only a subdir directly inside
+
+    let files = all_files(r.path()).unwrap();
+    let by = |p: &str| files.iter().find(|e| e.path == p);
+    assert!(by("notes/index.md").is_some_and(|e| !e.ignored), "untracked file listed");
+    assert!(by("notes/library").is_some_and(|e| e.ignored && e.is_dir), "ignored dir listed");
+    assert!(!files.iter().any(|e| e.path.starts_with("notes/library/")), "and not walked");
 }
 
 #[test]

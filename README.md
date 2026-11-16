@@ -1,14 +1,3 @@
-<div align="center">
-  <sup>Special thanks to:</sup>
-  <br><br>
-  <a href="https://getmoshi.app/?utm_source=herdr-reviewr&utm_medium=readme&utm_campaign=sponsor"><img alt="Moshi" width="120" src="assets/sponsors/moshi.svg"></a>
-
-### [Moshi: Terminals weren’t made for phones. Moshi is.](https://getmoshi.app/?utm_source=herdr-reviewr&utm_medium=readme&utm_campaign=sponsor)
-[A mobile terminal designed for AI coding agents.](https://getmoshi.app/?utm_source=herdr-reviewr&utm_medium=readme&utm_campaign=sponsor)<br>
-
-  <hr />
-</div>
-
 # herdr-reviewr
 
 [![CI](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml)
@@ -23,7 +12,7 @@ A code-review pane for [herdr](https://herdr.dev). Read your agent's diff beside
 comment on lines, and send the comments back.
 
 This is the [kuitos fork](https://github.com/kuitos/herdr-reviewr) of
-[persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) v0.49.0. Install it from
+[persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) v0.52.2. Install it from
 this fork: `herdr plugin install kuitos/herdr-reviewr`.
 
 ![demo](assets/demo.gif)
@@ -84,7 +73,8 @@ herdr-reviewr ~/some/repo
 2. **Focus the diff.** `Tab`.
 3. **Select lines.** `v`, then `j` / `k`, or drag the line numbers.
 4. **Comment.** `c`, type, `Enter`.
-5. **Send.** `s` puts every comment in the agent's input.
+5. **Send.** `s` puts every comment in the agent's input: the only agent, or the one beside
+   reviewr. `S` lets you pick.
 
 The footer shows the next step, and the worktree you're on at its right. `?` lists every key.
 
@@ -96,6 +86,10 @@ key = "cmd+r"   # many macOS terminals swallow alt+
 type = "plugin_action"
 command = "persiyanov.reviewr.toggle"
 ```
+
+On Windows, `cmd` is the Windows key, and Windows takes `cmd+r` first. Use another key, such as
+`prefix+f`. A key for a remote machine goes in that machine's `config.toml`, because custom commands
+belong to the server where the panes run. Choose **reload config** in herdr's menu to apply it.
 
 ## Controls
 
@@ -141,7 +135,8 @@ Every key can be rebound ([Keybindings](#keybindings)).
 | `d` | Delete comment |
 | `n` `N` | Next / previous comment |
 | `l` | List comments |
-| `s` | Send comments to the agent |
+| `s` | Send comments to the agent beside reviewr, or pick one |
+| `S` | Pick the agent, then send |
 | `y` | Copy comments |
 | `esc` | Clear selection |
 
@@ -174,6 +169,9 @@ and links. Scroll with the wheel.
 - **Changes** — files the current scope changed.
 - **All files** — every file in the worktree. You can comment here too. Git-ignored files are dimmed.
 - **PR** — the branch's pull request (merge request on GitLab): state, checks, description, comments.
+
+Switching between **Changes** and **All files** keeps your file and line when the other tab lists
+the file. `follow_file_across_tabs = false` gives each tab its own place instead.
 
 ## Diff scopes
 
@@ -208,6 +206,8 @@ navigator_position = "bottom"       # right | bottom | left | top
 toggle_placement = "overlay"        # split | overlay | zoomed | tab
 toggle_direction = "down"           # right | down, for split
 auto_open = false
+follow_file_across_tabs = false
+scrolloff = 0                       # lines kept around the diff cursor, 3 by default; 999 centers
 editor = "code -g {file}:{line}"
 url_opener = "browser-bridge --new-tab {url}"
 review_prefix = "Fix each comment, then run the tests."
@@ -288,6 +288,7 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `down` / `up` | `j` / `k` |
 | `next-hunk` / `prev-hunk` | `]` / `[` |
 | `next-file` / `prev-file` | `f` / `F` |
+| `switch-pane` | `tab` |
 | `scope-uncommitted` / `scope-branch` / `scope-last-turn` / `scope-commits` | `u` / `b` / `t` / `g` |
 | `base-pick` / `commit-pick` | `B` / `G` |
 | `worktree-pick` | `W` |
@@ -307,25 +308,31 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `find` | `ctrl+f` |
 | `goto-line` | `:` |
 | `keys` | `?` |
-| `send` | `s`, `S` |
+| `send` | `s` |
+| `send-to` | `S` |
 | `copy` | `y`, `Y` |
 | `open-pr` | `o` |
 | `refresh` | `r` |
 | `quit` | `q` |
 | `quit-discard` | `Q` |
 
-A key is one character or a `ctrl+` / `alt+` chord. `Tab`, `Esc`, and `Enter` are fixed.
+A key is one character, a named key (`tab`, `left`, `right`, `up`, `down`, `pageup`, `pagedown`),
+or a `ctrl+` / `alt+` chord. `Esc` and `Enter` are fixed.
 
 ### GitHub, GitLab, and Azure DevOps
 
 The PR tab reads the `upstream` remote, else `origin`, so forks work. Self-hosted servers need
 `github_host`, `gitlab_host`, or `azure_devops_host`, matching the remote's hostname exactly.
-SSH aliases like `github.com-work` don't match.
+An SSH alias like `github.com-work` resolves through your ssh config to the host it stands for.
 
 ### Pane placement
 
 The toggle opens reviewr right of your agent. `toggle_placement` changes that: `overlay` covers
 the tab, `zoomed` fills it, `tab` opens a new one.
+
+Each tab gets its own reviewr; with `tab` placement, each worktree gets its own reviewr tab. The
+toggle closes your reviewr when you can see it, takes you to it when you can't, and opens one when
+there's none. `close` closes yours.
 
 reviewr opens on its own in a new worktree's workspace, with `split` or `tab` only, and leaves
 your agent focused. `auto_open = false` turns that off.
@@ -346,7 +353,7 @@ On Windows, point it at the plugin's own `bin` folder.
 - **Network drives send no file events.** macOS and Linux check every five seconds. On Windows,
   press `r`.
 - **Send needs an agent in the workspace**, and refuses one at a permission prompt. Your
-  comments stay.
+  comments stay. With several agents, it goes to the only one in reviewr's tab, else it asks.
 - **last turn shows all of a turn or nothing.** If the agent writes the instant a turn starts,
   the scope shows nothing for that turn and says why.
 - **The PR tab** supports GitHub, GitLab, and Azure DevOps only. A merged or closed PR shows as
